@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fuji Fruit Bot Dashboard</title>
+    <link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+    <!-- Top Navigation -->
+    <nav class="top-nav">
+        <div class="nav-left">
+            <button class="mobile-menu-btn" id="mobileMenuBtn">
+                <span></span>
+                <span></span>
+                <span></span>
+            </button>
+            <div class="brand">
+                <span class="brand-icon">🍑</span>
+                <span class="brand-text">Fuji Fruit Bot</span>
+            </div>
+        </div>
+        
+        <div class="nav-right">
+            <div class="user-profile">
+                <select class="server-dropdown" id="serverDropdown">
+                    <option value="">Select Server...</option>
+                </select>
+                <div class="user-avatar" id="userAvatar"></div>
+                <span class="username" id="username">Loading...</span>
+                <a href="/logout" class="logout-btn">Sign Out</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Layout -->
+    <div class="app-layout">
+        <!-- Sidebar -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <h3>Navigation</h3>
+            </div>
+            <nav class="sidebar-nav">
+                <ul class="nav-menu">
+                    <li>
+                        <a class="nav-link active" data-page="overview">
+                            <span class="nav-icon">🏠</span>
+                            <span class="nav-text">Dashboard</span>
+                        </a>
+                    </li>
+                    <!-- Plugin navigation links will be dynamically generated here -->
+                </ul>
+            </nav>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Overview Page -->
+            <div id="overview-page" class="page active">
+                    <div class="page-header">
+                    <div class="header-content">
+                        <h1 class="page-title">Dashboard</h1>
+                        <p class="page-subtitle">Central Hub for Personal Customization</p>
+                    </div>
+                </div>
+
+                <!-- Stats Grid -->
+                <div class="stats-section">
+                    <div class="stats-grid">
+                        <div class="stat-card primary">
+                            <div class="stat-icon linkedin"></div>
+                            <div class="stat-content">
+                                <div class="stat-value" id="onlineUsers">0</div>
+                                <div class="stat-label">People Currently Online</div>
+                            </div>
+                        </div>
+                        
+                        <div class="stat-card danger">
+                            <div class="stat-icon youtube"></div>
+                            <div class="stat-content">
+                                <div class="stat-value" id="totalServerUsers">0</div>
+                                <div class="stat-label">Total Server Users</div>
+                            </div>
+                        </div>
+                        
+                        <div class="stat-card success">
+                            <div class="stat-icon instagram"></div>
+                            <div class="stat-content">
+                                <div class="stat-value" id="activePlugins">0</div>
+                                <div class="stat-label">Active Plugins</div>
+                            </div>
+                        </div>
+                        
+                        <div class="stat-card warning">
+                            <div class="stat-icon tiktok"></div>
+                            <div class="stat-content">
+                                <div class="stat-value" id="totalServerMessages">0</div>
+                                <div class="stat-label">Total Server Messages</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Main Dashboard Grid -->
+                <div class="dashboard-grid">
+                    <!-- Left Column -->
+                    <div class="dashboard-left">
+                        <!-- Console Log Widget -->
+                        <div class="widget console-widget">
+                            <div class="widget-header">
+                                <h3>Console Log</h3>
+                                <div class="console-controls">
+                                    <button class="console-clear-btn">Clear</button>
+                                    <button class="console-toggle-btn" id="consoleToggle">
+                                        <span class="toggle-icon">−</span>
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="widget-content console-content" id="consoleContent">
+                                <div class="console-log" id="consoleLog">
+                                    <div class="log-entry log-info">
+                                        <span class="log-time">09:45:23</span>
+                                        <span class="log-level">INFO</span>
+                                        <span class="log-message">Bot successfully connected to Discord</span>
+                                    </div>
+                                    <div class="log-entry log-success">
+                                        <span class="log-time">09:45:24</span>
+                                        <span class="log-level">SUCCESS</span>
+                                        <span class="log-message">Loaded 8 plugins successfully</span>
+                                    </div>
+                                    <div class="log-entry log-info">
+                                        <span class="log-time">09:45:25</span>
+                                        <span class="log-level">INFO</span>
+                                        <span class="log-message">Dashboard server started on port 3000</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Features Grid -->
+                        <div class="widget features-widget">
+                            <div class="widget-header">
+                                <h3>Available Features</h3>
+                            </div>
+                            <div class="widget-content">
+                                <div id="feature-grid" class="features-grid">
+                                    <!-- Feature cards will be dynamically generated here -->
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Right Column -->
+                    <div class="dashboard-right">
+                        <!-- Moderator Profiles Widget -->
+                        <div class="widget moderators-widget">
+                            <div class="widget-header">
+                                <h3>Moderator Profiles</h3>
+                            </div>
+                            <div class="widget-content">
+                                <div class="moderators-list" id="moderatorsList">
+                                    <div class="moderator-item">
+                                        <div class="moderator-avatar">👤</div>
+                                        <div class="moderator-info">
+                                            <div class="moderator-name">Admin User</div>
+                                            <div class="moderator-role admin">Administrator</div>
+                                            <div class="moderator-last-action">Used Message Sender 2h ago</div>
+                                        </div>
+                                        <div class="moderator-actions">
+                                            <span class="action-count">23</span>
+                                            <span class="action-label">actions today</span>
+                                        </div>
+                                    </div>
+                                    <div class="moderator-item">
+                                        <div class="moderator-avatar">👤</div>
+                                        <div class="moderator-info">
+                                            <div class="moderator-name">Mod User</div>
+                                            <div class="moderator-role moderator">Moderator</div>
+                                            <div class="moderator-last-action">Used Word Filter 4h ago</div>
+                                        </div>
+                                        <div class="moderator-actions">
+                                            <span class="action-count">8</span>
+                                            <span class="action-label">actions today</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <button class="btn btn-secondary view-all-btn">View All Actions</button>
+                            </div>
+                        </div>
+
+                        <!-- Earnings Chart -->
+                        <div class="widget earnings-widget">
+                            <div class="widget-header">
+                                <h3>Server Activity</h3>
+                                <div class="widget-controls">
+                                    <span class="toggle-label">Realtime</span>
+                                    <label class="toggle">
+                                        <input type="checkbox" checked>
+                                        <span class="slider"></span>
+                                    </label>
+                                    <select class="time-select">
+                                        <option>1 month</option>
+                                        <option>3 months</option>
+                                        <option>6 months</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="widget-content">
+                                <div class="chart-container">
+                                    <canvas id="activityChart" width="400" height="200"></canvas>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Quick Message Sender -->
+                        <div class="widget quick-message-widget">
+                            <div class="widget-header">
+                                <h3>Quick Message Sender</h3>
+                            </div>
+                            <div class="widget-content">
+                                <div class="quick-message-form">
+                                    <div class="form-group">
+                                        <select class="form-control" id="quickChannelSelect">
+                                            <option value="">Select Channel...</option>
+                                        </select>
+                                    </div>
+                                    <div class="form-group">
+                                        <textarea 
+                                            class="form-control message-textarea" 
+                                            id="quickMessageText" 
+                                            placeholder="Type your message..."
+                                            rows="3"
+                                        ></textarea>
+                                    </div>
+                                    <button class="btn btn-primary send-btn" id="quickSendBtn">
+                                        <span class="btn-icon">📤</span>
+                                        Send Message
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Top Members Leaderboards -->
+                        <div class="widget leaderboards-widget">
+                            <div class="widget-header">
+                                <h3>Top Members</h3>
+                                <div class="search-small">
+                                    <input type="text" placeholder="Search Members..." class="search-input-small" id="membersSearch">
+                                </div>
+                            </div>
+                            <div class="widget-content">
+                                <div class="leaderboard-tabs">
+                                    <button class="tab-btn active" data-tab="reputation">Top Reputation</button>
+                                    <button class="tab-btn" data-tab="levels">Top Levels</button>
+                                </div>
+                                
+                                <div class="tab-content active" id="reputation-tab">
+                                    <div class="leaderboard-list" id="reputationLeaderboard">
+                                        <div class="leaderboard-item">
+                                            <div class="rank">#1</div>
+                                            <div class="member-info">
+                                                <div class="member-avatar">👤</div>
+                                                <div class="member-details">
+                                                    <div class="member-name">SuperUser</div>
+                                                    <div class="member-stats">1,250 reputation</div>
+                                                </div>
+                                            </div>
+                                            <div class="member-progress">
+                                                <div class="progress-bar">
+                                                    <div class="progress-fill" style="width: 95%"></div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="leaderboard-item">
+                                            <div class="rank">#2</div>
+                                            <div class="member-info">
+                                                <div class="member-avatar">👤</div>
+                                                <div class="member-details">
+                                                    <div class="member-name">ActiveMember</div>
+                                                    <div class="member-stats">980 reputation</div>
+                                                </div>
+                                            </div>
+                                            <div class="member-progress">
+                                                <div class="progress-bar">
+                                                    <div class="progress-fill" style="width: 75%"></div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="leaderboard-item">
+                                            <div class="rank">#3</div>
+                                            <div class="member-info">
+                                                <div class="member-avatar">👤</div>
+                                                <div class="member-details">
+                                                    <div class="member-name">HelpfulUser</div>
+                                                    <div class="member-stats">756 reputation</div>
+                                                </div>
+                                            </div>
+                                            <div class="member-progress">
+                                                <div class="progress-bar">
+                                                    <div class="progress-fill" style="width: 60%"></div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <div class="tab-content" id="levels-tab">
+                                    <div class="leaderboard-list" id="levelsLeaderboard">
+                                        <div class="leaderboard-item">
+                                            <div class="rank">#1</div>
+                                            <div class="member-info">
+                                                <div class="member-avatar">👤</div>
+                                                <div class="member-details">
+                                                    <div class="member-name">ChatMaster</div>
+                                                    <div class="member-stats">Level 45 (12,500 XP)</div>
+                                                </div>
+                                            </div>
+                                            <div class="member-progress">
+                                                <div class="progress-bar">
+                                                    <div class="progress-fill" style="width: 90%"></div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="leaderboard-item">
+                                            <div class="rank">#2</div>
+                                            <div class="member-info">
+                                                <div class="member-avatar">👤</div>
+                                                <div class="member-details">
+                                                    <div class="member-name">VoiceChampion</div>
+                                                    <div class="member-stats">Level 42 (11,200 XP)</div>
+                                                </div>
+                                            </div>
+                                            <div class="member-progress">
+                                                <div class="progress-bar">
+                                                    <div class="progress-fill" style="width: 85%"></div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="leaderboard-item">
+                                            <div class="rank">#3</div>
+                                            <div class="member-info">
+                                                <div class="member-avatar">👤</div>
+                                                <div class="member-details">
+                                                    <div class="member-name">ReactKing</div>
+                                                    <div class="member-stats">Level 38 (9,800 XP)</div>
+                                                </div>
+                                            </div>
+                                            <div class="member-progress">
+                                                <div class="progress-bar">
+                                                    <div class="progress-fill" style="width: 70%"></div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Dynamic Plugin Pages -->
+            <div id="message-sender-page" class="page">
+                <div id="messagePluginContainer"></div>
+            </div>
+            
+            <div id="word-filter-page" class="page">
+                <div id="wordFilterPluginContainer"></div>
+            </div>
+            
+            <div id="leveling-page" class="page">
+                <div id="levelingPluginContainer"></div>
+            </div>
+            
+            <div id="channel-rules-page" class="page">
+                <div id="channelRulesPluginContainer"></div>
+            </div>
+            
+            <div id="auto-role-page" class="page">
+                <div id="autoRolePluginContainer"></div>
+            </div>
+            
+            <div id="genre-discovery-page" class="page">
+                <div id="genreDiscoveryPluginContainer"></div>
+            </div>
+            
+            <div id="reputation-page" class="page">
+                <div id="reputationPluginContainer"></div>
+            </div>
+            
+            <div id="migration-page" class="page">
+                <div id="migrationPluginContainer"></div>
+            </div>
+            
+            <div id="custom-commands-page" class="page">
+                <div id="customCommandsPluginContainer"></div>
+            </div>
+            
+            <div id="event-manager-page" class="page">
+                <div id="eventManagerContainer"></div>
+            </div>
+        </main>
+    </div>
+
+    <script src="dashboard.js"></script>
+</body>
+</html>
