@@ -4,8 +4,8 @@ const path = require('path');
 class LevelingPlugin {
     constructor(app, client, ensureAuthenticated, hasAdminPermissions) {
         this.name = 'Leveling System';
-        this.description = 'XP and leveling system with multiple XP sources and leaderboards';
-        this.version = '1.0.0';
+        this.description = 'XP and leveling system with multiple sources and leaderboards';
+        this.version = '2.0.0';
         this.enabled = true;
         
         this.app = app;
@@ -13,467 +13,268 @@ class LevelingPlugin {
         this.ensureAuthenticated = ensureAuthenticated;
         this.hasAdminPermissions = hasAdminPermissions;
         
-        this.dataFile = path.join(__dirname, '../data/levelingData.json');
-        this.settingsFile = path.join(__dirname, '../data/levelingSettings.json');
-        
-        // Backup configuration
-        this.backupDir = path.join(__dirname, '../backups');
-        this.maxBackups = 50; // Keep last 50 backups
-        this.backupInterval = 30 * 60 * 1000; // 30 minutes
-        this.dailyBackupHour = 3; // 3 AM daily backup
-        
-        // XP calculation constants
-        this.XP_RATES = {
-            MESSAGE: { min: 15, max: 25 },
-            VOICE_PER_MINUTE: 10,
-            REACTION_GIVEN: 5,
-            REACTION_RECEIVED: 3
-        };
-        
-        // Rate limiting (prevent XP farming)
-        this.MESSAGE_COOLDOWN = 60000; // 1 minute between XP gains from messages
-        this.VOICE_UPDATE_INTERVAL = 60000; // Update voice XP every minute
-        
-        this.userCooldowns = new Map();
-        this.voiceTracker = new Map(); // Track voice session start times
+        this.dataPath = path.join(__dirname, '../data/levelingData.json');
+        this.settingsPath = path.join(__dirname, '../data/levelingSettings.json');
         
         this.initializeData();
-        this.initializeBackupSystem();
         this.setupRoutes();
-        this.setupBackupRoutes();
-        this.setupDiscordListeners();
-        this.setupSlashCommands();
-        
-        // Start voice tracking interval
-        setInterval(() => this.updateVoiceXP(), this.VOICE_UPDATE_INTERVAL);
+        this.setupEventListeners();
+        this.registerSlashCommands();
     }
 
     async initializeData() {
         try {
             // Initialize leveling data file
             try {
-                await fs.access(this.dataFile);
+                await fs.access(this.dataPath);
             } catch {
-                const initialData = {
-                    users: {}, // userId: { guildId: { xp, level, lastMessageTime, voiceTime, reactionsGiven, reactionsReceived } }
-                    leaderboards: {} // guildId: { overall: [], voice: [], reactions: [], weekly: [], monthly: [] }
-                };
-                await fs.writeFile(this.dataFile, JSON.stringify(initialData, null, 2));
+                await fs.writeFile(this.dataPath, JSON.stringify({ users: {} }, null, 2));
             }
-            
+
             // Initialize settings file
             try {
-                await fs.access(this.settingsFile);
+                await fs.access(this.settingsPath);
             } catch {
-                const initialSettings = {
-                    // guildId: { xpSources: { messages, voice, reactions }, levelUpChannel, xpMultiplier }
-                };
-                await fs.writeFile(this.settingsFile, JSON.stringify(initialSettings, null, 2));
+                await fs.writeFile(this.settingsPath, JSON.stringify({}, null, 2));
             }
         } catch (error) {
             console.error('Error initializing leveling data:', error);
         }
     }
 
-    async initializeBackupSystem() {
-        try {
-            // Ensure backup directory exists
-            await fs.mkdir(this.backupDir, { recursive: true });
-            
-            // Start automatic backup intervals
-            this.startPeriodicBackups();
-            this.startDailyBackups();
-            
-            // Create initial backup on startup
-            await this.createBackup('startup');
-            
-            console.log('✓ Backup system initialized');
-        } catch (error) {
-            console.error('Error initializing backup system:', error);
-        }
-    }
-
-    async createBackup(type = 'manual', reason = '') {
-        try {
-            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-            const backupFilename = `levelingData_${type}_${timestamp}.json`;
-            const backupPath = path.join(this.backupDir, backupFilename);
-            
-            // Read current data
-            const currentData = await this.loadDataRaw();
-            
-            // Add backup metadata
-            const backupData = {
-                metadata: {
-                    timestamp: new Date().toISOString(),
-                    type: type,
-                    reason: reason,
-                    version: this.version,
-                    userCount: Object.keys(currentData.users || {}).length,
-                    guildCount: this.getGuildCount(currentData)
-                },
-                data: currentData
-            };
-            
-            // Write backup file
-            await fs.writeFile(backupPath, JSON.stringify(backupData, null, 2));
-            
-            // Cleanup old backups
-            await this.cleanupOldBackups();
-            
-            console.log(`✓ Backup created: ${backupFilename}`);
-            return backupPath;
-            
-        } catch (error) {
-            console.error('Error creating backup:', error);
-            throw error;
-        }
-    }
-
-    async loadData() {
-        try {
-            const data = await fs.readFile(this.dataFile, 'utf8');
-            const parsedData = JSON.parse(data);
-            
-            // Validate data structure
-            if (!parsedData.users || typeof parsedData.users !== 'object') {
-                throw new Error('Invalid data structure: missing users object');
-            }
-            
-            return parsedData;
-        } catch (error) {
-            console.error('Error loading leveling data:', error);
-            
-            // Try to restore from most recent backup
-            const restoredData = await this.tryRestoreFromBackup();
-            if (restoredData) {
-                console.log('✓ Data restored from backup');
-                return restoredData;
-            }
-            
-            // Last resort: return empty structure
-            console.warn('⚠️ No backups available. Starting with empty data.');
-            return { users: {}, leaderboards: {} };
-        }
-    }
-
-    async loadDataRaw() {
-        try {
-            const data = await fs.readFile(this.dataFile, 'utf8');
-            return JSON.parse(data);
-        } catch (error) {
-            return { users: {}, leaderboards: {} };
-        }
-    }
-
-    async saveData(data) {
-        try {
-            // Validate data before saving
-            if (!data.users || typeof data.users !== 'object') {
-                throw new Error('Invalid data structure: missing users object');
-            }
-            
-            // Create pre-save backup
-            await this.createBackup('pre-save', 'Before data modification');
-            
-            // Write to temporary file first (atomic operation)
-            const tempFile = this.dataFile + '.tmp';
-            await fs.writeFile(tempFile, JSON.stringify(data, null, 2));
-            
-            // Verify the temp file can be parsed
-            const verification = JSON.parse(await fs.readFile(tempFile, 'utf8'));
-            if (!verification.users) {
-                throw new Error('Verification failed: corrupted temp file');
-            }
-            
-            // Rename temp file to actual file (atomic operation)
-            await fs.rename(tempFile, this.dataFile);
-            
-        } catch (error) {
-            console.error('Error saving leveling data:', error);
-            
-            // Clean up temp file if it exists
+    setupRoutes() {
+        // Get leveling statistics for dashboard
+        this.app.get('/api/plugins/leveling/stats/:guildId', this.ensureAuthenticated, async (req, res) => {
             try {
-                await fs.unlink(this.dataFile + '.tmp');
-            } catch {}
-            
-            throw error;
-        }
-    }
-
-    async tryRestoreFromBackup() {
-        try {
-            const backupFiles = await fs.readdir(this.backupDir);
-            const levelingBackups = backupFiles
-                .filter(file => file.startsWith('levelingData_') && file.endsWith('.json'))
-                .sort()
-                .reverse(); // Most recent first
-            
-            for (const backupFile of levelingBackups) {
-                try {
-                    const backupPath = path.join(this.backupDir, backupFile);
-                    const backupContent = await fs.readFile(backupPath, 'utf8');
-                    const backup = JSON.parse(backupContent);
-                    
-                    // Check if backup has proper structure
-                    const data = backup.data || backup; // Handle both new and old backup formats
-                    if (data.users && typeof data.users === 'object') {
-                        // Restore the main file
-                        await fs.writeFile(this.dataFile, JSON.stringify(data, null, 2));
-                        console.log(`✓ Restored from backup: ${backupFile}`);
-                        return data;
-                    }
-                } catch (error) {
-                    console.warn(`⚠️ Backup file corrupted: ${backupFile}`);
-                    continue;
+                const { guildId } = req.params;
+                
+                if (!await this.hasAdminPermissions(req.user.id, guildId)) {
+                    return res.status(403).json({ error: 'Insufficient permissions' });
                 }
-            }
-            
-            return null;
-        } catch (error) {
-            console.error('Error restoring from backup:', error);
-            return null;
-        }
-    }
 
-    startPeriodicBackups() {
-        // Create backup every 30 minutes
-        setInterval(async () => {
-            try {
-                await this.createBackup('periodic', 'Automatic periodic backup');
+                const data = await this.loadData();
+                const settings = await this.loadSettings();
+                
+                // Calculate server statistics
+                const serverUsers = Object.keys(data.users).filter(userId => 
+                    data.users[userId][guildId]
+                ).length;
+                
+                let totalXP = 0;
+                let totalVoiceTime = 0;
+                let totalReactions = 0;
+                let maxLevel = 0;
+                
+                Object.keys(data.users).forEach(userId => {
+                    const userData = data.users[userId][guildId];
+                    if (userData) {
+                        totalXP += userData.xp || 0;
+                        totalVoiceTime += userData.voiceTime || 0;
+                        totalReactions += (userData.reactionsGiven || 0) + (userData.reactionsReceived || 0);
+                        maxLevel = Math.max(maxLevel, userData.level || 0);
+                    }
+                });
+
+                res.json({
+                    serverUsers,
+                    totalXP,
+                    totalVoiceTime,
+                    totalReactions,
+                    maxLevel,
+                    isEnabled: this.isLevelingEnabled(guildId, settings)
+                });
             } catch (error) {
-                console.error('Error in periodic backup:', error);
+                console.error('Error fetching leveling stats:', error);
+                res.status(500).json({ error: 'Failed to fetch leveling statistics' });
             }
-        }, this.backupInterval);
-    }
+        });
 
-    startDailyBackups() {
-        // Create daily backup at specified hour
-        setInterval(async () => {
-            const now = new Date();
-            if (now.getHours() === this.dailyBackupHour && now.getMinutes() < 5) {
-                try {
-                    await this.createBackup('daily', 'Daily scheduled backup');
-                } catch (error) {
-                    console.error('Error in daily backup:', error);
-                }
-            }
-        }, 5 * 60 * 1000); // Check every 5 minutes
-    }
-
-    async cleanupOldBackups() {
-        try {
-            const backupFiles = await fs.readdir(this.backupDir);
-            const levelingBackups = backupFiles
-                .filter(file => file.startsWith('levelingData_') && file.endsWith('.json'))
-                .map(file => ({
-                    name: file,
-                    path: path.join(this.backupDir, file),
-                    stat: null
-                }));
-            
-            // Get file stats for sorting by creation time
-            for (const backup of levelingBackups) {
-                try {
-                    backup.stat = await fs.stat(backup.path);
-                } catch (error) {
-                    console.warn(`Could not stat backup file: ${backup.name}`);
-                }
-            }
-            
-            // Sort by creation time (oldest first)
-            const validBackups = levelingBackups
-                .filter(backup => backup.stat)
-                .sort((a, b) => a.stat.birthtime - b.stat.birthtime);
-            
-            // Remove old backups if we exceed the limit
-            if (validBackups.length > this.maxBackups) {
-                const toDelete = validBackups.slice(0, validBackups.length - this.maxBackups);
+        // Get leveling settings
+        this.app.get('/api/plugins/leveling/settings/:guildId', this.ensureAuthenticated, async (req, res) => {
+            try {
+                const { guildId } = req.params;
                 
-                for (const backup of toDelete) {
-                    try {
-                        await fs.unlink(backup.path);
-                        console.log(`🗑️ Deleted old backup: ${backup.name}`);
-                    } catch (error) {
-                        console.warn(`Could not delete backup: ${backup.name}`);
-                    }
+                if (!await this.hasAdminPermissions(req.user.id, guildId)) {
+                    return res.status(403).json({ error: 'Insufficient permissions' });
                 }
-            }
-            
-        } catch (error) {
-            console.error('Error cleaning up old backups:', error);
-        }
-    }
 
-    getGuildCount(data) {
-        const guilds = new Set();
-        for (const user of Object.values(data.users || {})) {
-            for (const guildId of Object.keys(user)) {
-                guilds.add(guildId);
-            }
-        }
-        return guilds.size;
-    }
-
-    async loadSettings() {
-        try {
-            const settings = await fs.readFile(this.settingsFile, 'utf8');
-            return JSON.parse(settings);
-        } catch (error) {
-            console.error('Error loading leveling settings:', error);
-            return {};
-        }
-    }
-
-    async saveSettings(settings) {
-        try {
-            await fs.writeFile(this.settingsFile, JSON.stringify(settings, null, 2));
-        } catch (error) {
-            console.error('Error saving leveling settings:', error);
-        }
-    }
-
-    calculateLevel(xp) {
-        // Level formula: level = floor(sqrt(xp / 100))
-        // XP needed for level n: n^2 * 100
-        return Math.floor(Math.sqrt(xp / 100));
-    }
-
-    getXPForLevel(level) {
-        return level * level * 100;
-    }
-
-    getXPNeededForNextLevel(currentXP) {
-        const currentLevel = this.calculateLevel(currentXP);
-        const nextLevelXP = this.getXPForLevel(currentLevel + 1);
-        return nextLevelXP - currentXP;
-    }
-
-    // ✅ FIXED: Added preserveLevel parameter to prevent level recalculation during restore
-    async addXP(userId, guildId, amount, source = 'manual', preserveLevel = false) {
-        const data = await this.loadData();
-        
-        if (!data.users[userId]) {
-            data.users[userId] = {};
-        }
-        
-        if (!data.users[userId][guildId]) {
-            data.users[userId][guildId] = {
-                xp: 0,
-                level: 0,
-                lastMessageTime: 0,
-                voiceTime: 0,
-                reactionsGiven: 0,
-                reactionsReceived: 0
-            };
-        }
-        
-        const userGuildData = data.users[userId][guildId];
-        const oldLevel = userGuildData.level;
-        
-        userGuildData.xp += amount;
-        
-        // ✅ FIXED: Only recalculate level if not preserving existing level
-        if (!preserveLevel) {
-            userGuildData.level = this.calculateLevel(userGuildData.xp);
-        }
-        
-        // Track source-specific stats
-        if (source === 'reaction_given') userGuildData.reactionsGiven++;
-        if (source === 'reaction_received') userGuildData.reactionsReceived++;
-        
-        await this.saveData(data);
-        
-        // Check for level up (only if not preserving level)
-        if (!preserveLevel && userGuildData.level > oldLevel) {
-            await this.handleLevelUp(userId, guildId, userGuildData.level, oldLevel);
-        }
-        
-        return userGuildData;
-    }
-
-    // ✅ NEW: Function to validate and sync user data after restore
-    async validateAndSyncUserData() {
-        try {
-            const data = await this.loadData();
-            let changesMade = false;
-            
-            // Validate each user's data
-            for (const [userId, guilds] of Object.entries(data.users)) {
-                for (const [guildId, userData] of Object.entries(guilds)) {
-                    if (userData && typeof userData === 'object') {
-                        // Ensure all required fields exist
-                        const requiredFields = {
-                            xp: 0,
-                            level: 0,
-                            lastMessageTime: 0,
-                            voiceTime: 0,
-                            reactionsGiven: 0,
-                            reactionsReceived: 0
-                        };
-                        
-                        for (const [field, defaultValue] of Object.entries(requiredFields)) {
-                            if (typeof userData[field] !== 'number') {
-                                userData[field] = defaultValue;
-                                changesMade = true;
-                            }
-                        }
-                        
-                        // ✅ IMPORTANT: Do NOT recalculate levels - preserve backed up levels
-                        // Only validate that level is reasonable compared to XP
-                        const calculatedLevel = this.calculateLevel(userData.xp);
-                        if (userData.level < 0) {
-                            userData.level = Math.max(0, calculatedLevel);
-                            changesMade = true;
-                        }
-                        // Allow backed up levels to be higher than calculated (for custom/bonus levels)
-                    }
-                }
-            }
-            
-            if (changesMade) {
-                await this.saveData(data);
-                console.log('✓ User data validated and synchronized');
-            }
-            
-            return { success: true, changesMade };
-        } catch (error) {
-            console.error('Error validating user data:', error);
-            return { success: false, error: error.message };
-        }
-    }
-
-    async handleLevelUp(userId, guildId, newLevel, oldLevel) {
-        try {
-            const settings = await this.loadSettings();
-            const guildSettings = settings[guildId];
-            
-            if (guildSettings && guildSettings.levelUpChannel) {
-                const channel = this.client.channels.cache.get(guildSettings.levelUpChannel);
-                const user = await this.client.users.fetch(userId);
+                const settings = await this.loadSettings();
+                const guildSettings = settings[guildId] || this.getDefaultSettings();
                 
-                if (channel && user) {
-                    const embed = {
-                        color: 0x00ff00,
-                        title: '🎉 Level Up!',
-                        description: `**${user.username}** leveled up from **${oldLevel}** to **${newLevel}**!`,
-                        thumbnail: { url: user.displayAvatarURL() },
-                        timestamp: new Date().toISOString()
+                res.json(guildSettings);
+            } catch (error) {
+                console.error('Error fetching leveling settings:', error);
+                res.status(500).json({ error: 'Failed to fetch settings' });
+            }
+        });
+
+        // Update leveling settings
+        this.app.post('/api/plugins/leveling/settings/:guildId', this.ensureAuthenticated, async (req, res) => {
+            try {
+                const { guildId } = req.params;
+                
+                if (!await this.hasAdminPermissions(req.user.id, guildId)) {
+                    return res.status(403).json({ error: 'Insufficient permissions' });
+                }
+
+                const settings = await this.loadSettings();
+                settings[guildId] = {
+                    ...this.getDefaultSettings(),
+                    ...req.body,
+                    updatedAt: new Date().toISOString()
+                };
+
+                await fs.writeFile(this.settingsPath, JSON.stringify(settings, null, 2));
+                
+                res.json({ success: true, message: 'Settings updated successfully' });
+            } catch (error) {
+                console.error('Error updating leveling settings:', error);
+                res.status(500).json({ error: 'Failed to update settings' });
+            }
+        });
+
+        // Get leaderboard data
+        this.app.get('/api/plugins/leveling/leaderboard/:guildId', this.ensureAuthenticated, async (req, res) => {
+            try {
+                const { guildId } = req.params;
+                const { type = 'overall', limit = 10 } = req.query;
+                
+                if (!await this.hasAdminPermissions(req.user.id, guildId)) {
+                    return res.status(403).json({ error: 'Insufficient permissions' });
+                }
+
+                const leaderboard = await this.generateLeaderboard(guildId, type, parseInt(limit));
+                
+                // Enrich with user data
+                const enrichedLeaderboard = await Promise.all(
+                    leaderboard.map(async (entry, index) => {
+                        try {
+                            const user = await this.client.users.fetch(entry.userId);
+                            return {
+                                rank: index + 1,
+                                userId: entry.userId,
+                                username: user.username,
+                                displayName: user.displayName || user.username,
+                                avatar: user.displayAvatarURL({ size: 64 }),
+                                value: entry.value,
+                                level: entry.level,
+                                progressToNext: this.calculateProgress(entry.xp || entry.value)
+                            };
+                        } catch {
+                            return {
+                                rank: index + 1,
+                                userId: entry.userId,
+                                username: 'Unknown User',
+                                displayName: 'Unknown User',
+                                avatar: null,
+                                value: entry.value,
+                                level: entry.level,
+                                progressToNext: 0
+                            };
+                        }
+                    })
+                );
+
+                res.json(enrichedLeaderboard);
+            } catch (error) {
+                console.error('Error fetching leaderboard:', error);
+                res.status(500).json({ error: 'Failed to fetch leaderboard' });
+            }
+        });
+
+        // Admin XP management
+        this.app.post('/api/plugins/leveling/manage-xp/:guildId', this.ensureAuthenticated, async (req, res) => {
+            try {
+                const { guildId } = req.params;
+                const { userId, amount, action } = req.body; // action: 'add', 'remove', 'set'
+                
+                if (!await this.hasAdminPermissions(req.user.id, guildId)) {
+                    return res.status(403).json({ error: 'Insufficient permissions' });
+                }
+
+                const data = await this.loadData();
+                
+                if (!data.users[userId]) {
+                    data.users[userId] = {};
+                }
+                
+                if (!data.users[userId][guildId]) {
+                    data.users[userId][guildId] = {
+                        xp: 0, level: 0, voiceTime: 0, 
+                        reactionsGiven: 0, reactionsReceived: 0
                     };
-                    
-                    await channel.send({ embeds: [embed] });
                 }
+
+                const userData = data.users[userId][guildId];
+                const oldXP = userData.xp;
+                
+                switch (action) {
+                    case 'add':
+                        userData.xp += Math.max(0, parseInt(amount));
+                        break;
+                    case 'remove':
+                        userData.xp = Math.max(0, userData.xp - Math.max(0, parseInt(amount)));
+                        break;
+                    case 'set':
+                        userData.xp = Math.max(0, parseInt(amount));
+                        break;
+                    default:
+                        return res.status(400).json({ error: 'Invalid action' });
+                }
+
+                // Recalculate level
+                userData.level = this.calculateLevel(userData.xp);
+                
+                await fs.writeFile(this.dataPath, JSON.stringify(data, null, 2));
+                
+                res.json({ 
+                    success: true, 
+                    message: `Successfully ${action}ed ${Math.abs(amount)} XP`,
+                    oldXP,
+                    newXP: userData.xp,
+                    newLevel: userData.level
+                });
+            } catch (error) {
+                console.error('Error managing XP:', error);
+                res.status(500).json({ error: 'Failed to manage XP' });
             }
-            
-            // Emit level up event for other plugins (like auto-role) to listen to
-            this.client.emit('levelUp', userId, guildId, newLevel, oldLevel);
-            
-        } catch (error) {
-            console.error('Error handling level up:', error);
-        }
+        });
+
+        // Export data
+        this.app.get('/api/plugins/leveling/export/:guildId', this.ensureAuthenticated, async (req, res) => {
+            try {
+                const { guildId } = req.params;
+                
+                if (!await this.hasAdminPermissions(req.user.id, guildId)) {
+                    return res.status(403).json({ error: 'Insufficient permissions' });
+                }
+
+                const data = await this.loadData();
+                const settings = await this.loadSettings();
+                
+                const exportData = {
+                    guildId,
+                    exportedAt: new Date().toISOString(),
+                    settings: settings[guildId] || {},
+                    users: Object.keys(data.users).reduce((acc, userId) => {
+                        if (data.users[userId][guildId]) {
+                            acc[userId] = data.users[userId][guildId];
+                        }
+                        return acc;
+                    }, {})
+                };
+
+                res.setHeader('Content-Type', 'application/json');
+                res.setHeader('Content-Disposition', `attachment; filename="leveling-data-${guildId}-${Date.now()}.json"`);
+                res.send(JSON.stringify(exportData, null, 2));
+            } catch (error) {
+                console.error('Error exporting data:', error);
+                res.status(500).json({ error: 'Failed to export data' });
+            }
+        });
     }
 
-    setupDiscordListeners() {
+    setupEventListeners() {
         // Message XP
         this.client.on('messageCreate', async (message) => {
             if (message.author.bot || !message.guild) return;
@@ -481,46 +282,37 @@ class LevelingPlugin {
             const settings = await this.loadSettings();
             const guildSettings = settings[message.guild.id];
             
-            if (!guildSettings || !guildSettings.xpSources?.messages) return;
+            if (!guildSettings?.xpSources?.messages) return;
             
-            const userId = message.author.id;
-            const guildId = message.guild.id;
-            const now = Date.now();
-            const cooldownKey = `${userId}-${guildId}`;
-            
-            // Check cooldown
-            if (this.userCooldowns.has(cooldownKey)) {
-                const lastXP = this.userCooldowns.get(cooldownKey);
-                if (now - lastXP < this.MESSAGE_COOLDOWN) return;
-            }
-            
-            const xpGain = Math.floor(Math.random() * (this.XP_RATES.MESSAGE.max - this.XP_RATES.MESSAGE.min + 1)) + this.XP_RATES.MESSAGE.min;
-            const multiplier = guildSettings.xpMultiplier || 1;
-            
-            this.userCooldowns.set(cooldownKey, now);
-            await this.addXP(userId, guildId, Math.floor(xpGain * multiplier), 'message');
+            await this.addXP(message.author.id, message.guild.id, 'message', guildSettings);
         });
 
-        // Voice XP tracking
+        // Voice XP
         this.client.on('voiceStateUpdate', async (oldState, newState) => {
-            const userId = newState.member?.id;
-            if (!userId) return;
+            const guildId = newState.guild?.id || oldState.guild?.id;
+            if (!guildId) return;
             
             const settings = await this.loadSettings();
+            const guildSettings = settings[guildId];
             
-            // User joined voice channel
-            if (!oldState.channel && newState.channel) {
-                const guildSettings = settings[newState.guild.id];
-                if (guildSettings?.xpSources?.voice) {
-                    this.voiceTracker.set(`${userId}-${newState.guild.id}`, Date.now());
-                }
+            if (!guildSettings?.xpSources?.voice) return;
+            
+            // User joined voice
+            if (!oldState.channelId && newState.channelId) {
+                this.voiceSessions = this.voiceSessions || {};
+                this.voiceSessions[`${guildId}-${newState.id}`] = Date.now();
             }
             
-            // User left voice channel
-            if (oldState.channel && !newState.channel) {
-                const trackingKey = `${userId}-${oldState.guild.id}`;
-                if (this.voiceTracker.has(trackingKey)) {
-                    this.voiceTracker.delete(trackingKey);
+            // User left voice
+            if (oldState.channelId && !newState.channelId) {
+                const sessionKey = `${guildId}-${newState.id}`;
+                if (this.voiceSessions?.[sessionKey]) {
+                    const sessionTime = Math.floor((Date.now() - this.voiceSessions[sessionKey]) / 60000); // minutes
+                    delete this.voiceSessions[sessionKey];
+                    
+                    if (sessionTime >= 1) { // Minimum 1 minute
+                        await this.addVoiceTime(newState.id, guildId, sessionTime, guildSettings);
+                    }
                 }
             }
         });
@@ -534,407 +326,274 @@ class LevelingPlugin {
             
             if (!guildSettings?.xpSources?.reactions) return;
             
-            const multiplier = guildSettings.xpMultiplier || 1;
-            
-            // XP for giving a reaction
-            await this.addXP(user.id, reaction.message.guild.id, Math.floor(this.XP_RATES.REACTION_GIVEN * multiplier), 'reaction_given');
-            
-            // XP for receiving a reaction (message author)
-            if (!reaction.message.author.bot) {
-                await this.addXP(reaction.message.author.id, reaction.message.guild.id, Math.floor(this.XP_RATES.REACTION_RECEIVED * multiplier), 'reaction_received');
+            await this.addReaction(user.id, reaction.message.guild.id, 'given', guildSettings);
+            await this.addReaction(reaction.message.author.id, reaction.message.guild.id, 'received', guildSettings);
+        });
+
+        // Slash command handling
+        this.client.on('interactionCreate', async (interaction) => {
+            if (!interaction.isChatInputCommand()) return;
+
+            try {
+                switch (interaction.commandName) {
+                    case 'level':
+                        await this.handleLevelCommand(interaction);
+                        break;
+                    case 'leaderboard':
+                        await this.handleLeaderboardCommand(interaction);
+                        break;
+                }
+            } catch (error) {
+                console.error('Error handling slash command:', error);
+                const errorMessage = 'An error occurred while processing this command.';
+                
+                if (interaction.deferred || interaction.replied) {
+                    await interaction.editReply(errorMessage);
+                } else {
+                    await interaction.reply({ content: errorMessage, ephemeral: true });
+                }
             }
         });
     }
 
-    async updateVoiceXP() {
-        const now = Date.now();
-        const settings = await this.loadSettings();
+    async registerSlashCommands() {
+        // Wait for client to be ready before registering commands
+        if (!this.client.isReady()) {
+            this.client.once('ready', () => {
+                this.registerSlashCommands();
+            });
+            return;
+        }
+
+        const commands = [
+            {
+                name: 'level',
+                description: 'Check your or someone else\'s level and XP',
+                options: [{
+                    name: 'user',
+                    description: 'The user to check (defaults to yourself)',
+                    type: 6, // USER
+                    required: false
+                }]
+            },
+            {
+                name: 'leaderboard',
+                description: 'View server leaderboards',
+                options: [
+                    {
+                        name: 'type',
+                        description: 'Type of leaderboard',
+                        type: 3, // STRING
+                        required: false,
+                        choices: [
+                            { name: 'Overall XP', value: 'overall' },
+                            { name: 'Voice Activity', value: 'voice' },
+                            { name: 'Reactions', value: 'reactions' }
+                        ]
+                    },
+                    {
+                        name: 'limit',
+                        description: 'Number of users to show (1-25)',
+                        type: 4, // INTEGER
+                        required: false,
+                        min_value: 1,
+                        max_value: 25
+                    }
+                ]
+            }
+        ];
+
+        try {
+            await this.client.application.commands.set(commands);
+            console.log('✅ Leveling slash commands registered');
+        } catch (error) {
+            console.error('❌ Error registering leveling commands:', error);
+        }
+    }
+
+    // Helper methods
+    getDefaultSettings() {
+        return {
+            xpSources: {
+                messages: true,
+                voice: true,
+                reactions: true
+            },
+            xpMultiplier: 1.0,
+            levelUpChannel: null,
+            levelUpMessage: '🎉 {user} reached level {level}!',
+            createdAt: new Date().toISOString()
+        };
+    }
+
+    async loadData() {
+        try {
+            const data = await fs.readFile(this.dataPath, 'utf8');
+            return JSON.parse(data);
+        } catch {
+            return { users: {} };
+        }
+    }
+
+    async loadSettings() {
+        try {
+            const data = await fs.readFile(this.settingsPath, 'utf8');
+            return JSON.parse(data);
+        } catch {
+            return {};
+        }
+    }
+
+    isLevelingEnabled(guildId, settings) {
+        const guildSettings = settings[guildId];
+        return guildSettings && (
+            guildSettings.xpSources?.messages || 
+            guildSettings.xpSources?.voice || 
+            guildSettings.xpSources?.reactions
+        );
+    }
+
+    calculateLevel(xp) {
+        return Math.floor(Math.sqrt(xp / 100));
+    }
+
+    getXPForLevel(level) {
+        return level * level * 100;
+    }
+
+    getXPNeededForNextLevel(currentXP) {
+        const currentLevel = this.calculateLevel(currentXP);
+        const nextLevelXP = this.getXPForLevel(currentLevel + 1);
+        return nextLevelXP - currentXP;
+    }
+
+    calculateProgress(xp) {
+        const level = this.calculateLevel(xp);
+        const currentLevelXP = this.getXPForLevel(level);
+        const nextLevelXP = this.getXPForLevel(level + 1);
+        const progress = xp - currentLevelXP;
+        const total = nextLevelXP - currentLevelXP;
+        return Math.floor((progress / total) * 100);
+    }
+
+    async addXP(userId, guildId, source, guildSettings) {
+        const data = await this.loadData();
         
-        for (const [trackingKey, startTime] of this.voiceTracker.entries()) {
-            const [userId, guildId] = trackingKey.split('-');
-            const guildSettings = settings[guildId];
-            
-            if (!guildSettings?.xpSources?.voice) continue;
-            
-            const timeInVoice = now - startTime;
-            if (timeInVoice >= this.VOICE_UPDATE_INTERVAL) {
-                const xpGain = Math.floor(this.XP_RATES.VOICE_PER_MINUTE * (guildSettings.xpMultiplier || 1));
-                await this.addXP(userId, guildId, xpGain, 'voice');
-                
-                // Update voice time stat
-                const data = await this.loadData();
-                if (data.users[userId] && data.users[userId][guildId]) {
-                    data.users[userId][guildId].voiceTime += 1;
-                    await this.saveData(data);
-                }
-                
-                // Reset tracking time
-                this.voiceTracker.set(trackingKey, now);
+        if (!data.users[userId]) data.users[userId] = {};
+        if (!data.users[userId][guildId]) {
+            data.users[userId][guildId] = {
+                xp: 0, level: 0, voiceTime: 0,
+                reactionsGiven: 0, reactionsReceived: 0
+            };
+        }
+
+        const userData = data.users[userId][guildId];
+        const baseXP = source === 'message' ? Math.floor(Math.random() * 15) + 10 : 5;
+        const xpGain = Math.floor(baseXP * (guildSettings.xpMultiplier || 1));
+        
+        const oldLevel = userData.level;
+        userData.xp += xpGain;
+        userData.level = this.calculateLevel(userData.xp);
+
+        // Level up notification
+        if (userData.level > oldLevel && guildSettings.levelUpChannel) {
+            try {
+                const channel = await this.client.channels.fetch(guildSettings.levelUpChannel);
+                const user = await this.client.users.fetch(userId);
+                const message = (guildSettings.levelUpMessage || '🎉 {user} reached level {level}!')
+                    .replace('{user}', `<@${userId}>`)
+                    .replace('{level}', userData.level);
+                await channel.send(message);
+            } catch (error) {
+                console.error('Error sending level up message:', error);
             }
         }
+
+        await fs.writeFile(this.dataPath, JSON.stringify(data, null, 2));
+    }
+
+    async addVoiceTime(userId, guildId, minutes, guildSettings) {
+        const data = await this.loadData();
+        
+        if (!data.users[userId]) data.users[userId] = {};
+        if (!data.users[userId][guildId]) {
+            data.users[userId][guildId] = {
+                xp: 0, level: 0, voiceTime: 0,
+                reactionsGiven: 0, reactionsReceived: 0
+            };
+        }
+
+        const userData = data.users[userId][guildId];
+        userData.voiceTime += minutes;
+        
+        // Add XP for voice time (1 XP per minute)
+        const xpGain = Math.floor(minutes * (guildSettings.xpMultiplier || 1));
+        userData.xp += xpGain;
+        userData.level = this.calculateLevel(userData.xp);
+
+        await fs.writeFile(this.dataPath, JSON.stringify(data, null, 2));
+    }
+
+    async addReaction(userId, guildId, type, guildSettings) {
+        const data = await this.loadData();
+        
+        if (!data.users[userId]) data.users[userId] = {};
+        if (!data.users[userId][guildId]) {
+            data.users[userId][guildId] = {
+                xp: 0, level: 0, voiceTime: 0,
+                reactionsGiven: 0, reactionsReceived: 0
+            };
+        }
+
+        const userData = data.users[userId][guildId];
+        
+        if (type === 'given') {
+            userData.reactionsGiven++;
+        } else {
+            userData.reactionsReceived++;
+        }
+        
+        // Add XP for reactions (2 XP per reaction)
+        const xpGain = Math.floor(2 * (guildSettings.xpMultiplier || 1));
+        userData.xp += xpGain;
+        userData.level = this.calculateLevel(userData.xp);
+
+        await fs.writeFile(this.dataPath, JSON.stringify(data, null, 2));
     }
 
     async generateLeaderboard(guildId, type = 'overall', limit = 10) {
         const data = await this.loadData();
-        const leaderboard = [];
-        
-        for (const [userId, guilds] of Object.entries(data.users)) {
-            if (guilds[guildId]) {
-                const userData = guilds[guildId];
-                let value;
-                
-                switch (type) {
-                    case 'voice':
-                        value = userData.voiceTime;
-                        break;
-                    case 'reactions':
-                        value = userData.reactionsGiven + userData.reactionsReceived;
-                        break;
-                    default:
-                        value = userData.xp;
-                }
-                
-                leaderboard.push({
+        const users = [];
+
+        Object.keys(data.users).forEach(userId => {
+            const userData = data.users[userId][guildId];
+            if (!userData) return;
+
+            let value;
+            switch (type) {
+                case 'voice':
+                    value = userData.voiceTime || 0;
+                    break;
+                case 'reactions':
+                    value = (userData.reactionsGiven || 0) + (userData.reactionsReceived || 0);
+                    break;
+                default:
+                    value = userData.xp || 0;
+            }
+
+            if (value > 0) {
+                users.push({
                     userId,
                     value,
-                    level: userData.level,
-                    xp: userData.xp
+                    level: userData.level || 0,
+                    xp: userData.xp || 0
                 });
             }
-        }
-        
-        return leaderboard
+        });
+
+        return users
             .sort((a, b) => b.value - a.value)
             .slice(0, limit);
-    }
-
-    setupRoutes() {
-        // Get leveling settings
-        this.app.get('/api/plugins/leveling/settings/:guildId', this.ensureAuthenticated, async (req, res) => {
-            try {
-                const { guildId } = req.params;
-                
-                if (!await this.hasAdminPermissions(req.user.id, guildId)) {
-                    return res.status(403).json({ error: 'Insufficient permissions' });
-                }
-                
-                const settings = await this.loadSettings();
-                const guildSettings = settings[guildId] || {
-                    xpSources: { messages: true, voice: true, reactions: true },
-                    levelUpChannel: null,
-                    xpMultiplier: 1.0
-                };
-                
-                res.json(guildSettings);
-            } catch (error) {
-                console.error('Error getting leveling settings:', error);
-                res.status(500).json({ error: 'Internal server error' });
-            }
-        });
-
-        // Update leveling settings
-        this.app.post('/api/plugins/leveling/settings/:guildId', this.ensureAuthenticated, async (req, res) => {
-            try {
-                const { guildId } = req.params;
-                
-                if (!await this.hasAdminPermissions(req.user.id, guildId)) {
-                    return res.status(403).json({ error: 'Insufficient permissions' });
-                }
-                
-                const settings = await this.loadSettings();
-                settings[guildId] = req.body;
-                await this.saveSettings(settings);
-                
-                res.json({ success: true });
-            } catch (error) {
-                console.error('Error updating leveling settings:', error);
-                res.status(500).json({ error: 'Internal server error' });
-            }
-        });
-
-        // Get user level/XP
-        this.app.get('/api/plugins/leveling/user/:guildId/:userId', this.ensureAuthenticated, async (req, res) => {
-            try {
-                const { guildId, userId } = req.params;
-                
-                const data = await this.loadData();
-                const userData = data.users[userId]?.[guildId] || {
-                    xp: 0, level: 0, voiceTime: 0, reactionsGiven: 0, reactionsReceived: 0
-                };
-                
-                const xpNeeded = this.getXPNeededForNextLevel(userData.xp);
-                const xpForCurrentLevel = this.getXPForLevel(userData.level);
-                const xpProgress = userData.xp - xpForCurrentLevel;
-                const xpForNextLevel = this.getXPForLevel(userData.level + 1) - xpForCurrentLevel;
-                
-                res.json({
-                    ...userData,
-                    xpNeeded,
-                    xpProgress,
-                    xpForNextLevel,
-                    progressPercentage: Math.floor((xpProgress / xpForNextLevel) * 100)
-                });
-            } catch (error) {
-                console.error('Error getting user data:', error);
-                res.status(500).json({ error: 'Internal server error' });
-            }
-        });
-
-        // Get leaderboard
-        this.app.get('/api/plugins/leveling/leaderboard/:guildId/:type?', this.ensureAuthenticated, async (req, res) => {
-            try {
-                const { guildId, type = 'overall' } = req.params;
-                const limit = parseInt(req.query.limit) || 10;
-                
-                const leaderboard = await this.generateLeaderboard(guildId, type, limit);
-                
-                // Fetch user info for leaderboard
-                const enrichedLeaderboard = await Promise.all(
-                    leaderboard.map(async (entry, index) => {
-                        try {
-                            const user = await this.client.users.fetch(entry.userId);
-                            return {
-                                rank: index + 1,
-                                userId: entry.userId,
-                                username: user.username,
-                                displayName: user.displayName || user.username,
-                                avatar: user.displayAvatarURL(),
-                                value: entry.value,
-                                level: entry.level,
-                                xp: entry.xp
-                            };
-                        } catch {
-                            return {
-                                rank: index + 1,
-                                userId: entry.userId,
-                                username: 'Unknown User',
-                                displayName: 'Unknown User',
-                                avatar: null,
-                                value: entry.value,
-                                level: entry.level,
-                                xp: entry.xp
-                            };
-                        }
-                    })
-                );
-                
-                res.json(enrichedLeaderboard);
-            } catch (error) {
-                console.error('Error getting leaderboard:', error);
-                res.status(500).json({ error: 'Internal server error' });
-            }
-        });
-
-        // Add XP manually (admin only)
-        this.app.post('/api/plugins/leveling/addxp', this.ensureAuthenticated, async (req, res) => {
-            try {
-                const { guildId, userId, amount } = req.body;
-                
-                if (!await this.hasAdminPermissions(req.user.id, guildId)) {
-                    return res.status(403).json({ error: 'Insufficient permissions' });
-                }
-                
-                const userData = await this.addXP(userId, guildId, parseInt(amount), 'manual');
-                res.json(userData);
-            } catch (error) {
-                console.error('Error adding XP:', error);
-                res.status(500).json({ error: 'Internal server error' });
-            }
-        });
-    }
-
-    setupBackupRoutes() {
-        // Create manual backup
-        this.app.post('/api/plugins/leveling/backup/create', this.ensureAuthenticated, async (req, res) => {
-            try {
-                const { reason } = req.body;
-                
-                const backupPath = await this.createBackup('manual', reason || 'Manual backup via dashboard');
-                
-                res.json({
-                    success: true,
-                    message: 'Backup created successfully',
-                    backupPath: path.basename(backupPath)
-                });
-            } catch (error) {
-                console.error('Error creating manual backup:', error);
-                res.status(500).json({ error: 'Failed to create backup' });
-            }
-        });
-
-        // List available backups
-        this.app.get('/api/plugins/leveling/backup/list', this.ensureAuthenticated, async (req, res) => {
-            try {
-                const backupFiles = await fs.readdir(this.backupDir);
-                const levelingBackups = [];
-                
-                for (const file of backupFiles) {
-                    if (file.startsWith('levelingData_') && file.endsWith('.json')) {
-                        try {
-                            const filePath = path.join(this.backupDir, file);
-                            const stat = await fs.stat(filePath);
-                            
-                            // Try to read metadata
-                            let metadata = null;
-                            try {
-                                const content = await fs.readFile(filePath, 'utf8');
-                                const backup = JSON.parse(content);
-                                metadata = backup.metadata;
-                            } catch {}
-                            
-                            levelingBackups.push({
-                                filename: file,
-                                size: stat.size,
-                                created: stat.birthtime,
-                                modified: stat.mtime,
-                                metadata: metadata
-                            });
-                        } catch (error) {
-                            console.warn(`Could not read backup file: ${file}`);
-                        }
-                    }
-                }
-                
-                // Sort by creation time (newest first)
-                levelingBackups.sort((a, b) => new Date(b.created) - new Date(a.created));
-                
-                res.json(levelingBackups);
-            } catch (error) {
-                console.error('Error listing backups:', error);
-                res.status(500).json({ error: 'Failed to list backups' });
-            }
-        });
-
-        // ✅ FIXED: Restore from backup with proper level preservation
-        this.app.post('/api/plugins/leveling/backup/restore', this.ensureAuthenticated, async (req, res) => {
-            try {
-                const { filename, guildId } = req.body;
-                
-                if (!await this.hasAdminPermissions(req.user.id, guildId)) {
-                    return res.status(403).json({ error: 'Insufficient permissions' });
-                }
-                
-                const backupPath = path.join(this.backupDir, filename);
-                
-                // Verify backup exists and is valid
-                const backupContent = await fs.readFile(backupPath, 'utf8');
-                const backup = JSON.parse(backupContent);
-                const data = backup.data || backup;
-                
-                if (!data.users || typeof data.users !== 'object') {
-                    throw new Error('Invalid backup data structure');
-                }
-                
-                // Create backup of current state before restoring
-                await this.createBackup('pre-restore', `Before restoring from ${filename}`);
-                
-                // ✅ IMPORTANT: Restore the data exactly as it was backed up
-                // Do NOT recalculate levels - preserve them exactly
-                await fs.writeFile(this.dataFile, JSON.stringify(data, null, 2));
-                
-                // ✅ NEW: Validate restored data without changing levels
-                const validationResult = await this.validateAndSyncUserData();
-                
-                res.json({
-                    success: true,
-                    message: `Successfully restored from backup: ${filename}`,
-                    userCount: Object.keys(data.users).length,
-                    validation: validationResult
-                });
-                
-            } catch (error) {
-                console.error('Error restoring backup:', error);
-                res.status(500).json({ error: 'Failed to restore backup: ' + error.message });
-            }
-        });
-
-        // ✅ NEW: Endpoint to manually sync data after restore if needed
-        this.app.post('/api/plugins/leveling/sync', this.ensureAuthenticated, async (req, res) => {
-            try {
-                const { guildId } = req.body;
-                
-                if (!await this.hasAdminPermissions(req.user.id, guildId)) {
-                    return res.status(403).json({ error: 'Insufficient permissions' });
-                }
-                
-                const result = await this.validateAndSyncUserData();
-                
-                res.json({
-                    success: true,
-                    message: 'Data validation completed',
-                    ...result
-                });
-                
-            } catch (error) {
-                console.error('Error syncing data:', error);
-                res.status(500).json({ error: 'Failed to sync data: ' + error.message });
-            }
-        });
-    }
-
-    setupSlashCommands() {
-        this.client.once('ready', async () => {
-            try {
-                const commands = [
-                    {
-                        name: 'level',
-                        description: 'Check your or someone else\'s level and XP',
-                        options: [
-                            {
-                                name: 'user',
-                                description: 'The user to check (defaults to yourself)',
-                                type: 6, // USER type
-                                required: false
-                            }
-                        ]
-                    },
-                    {
-                        name: 'leaderboard',
-                        description: 'View the server leaderboard',
-                        options: [
-                            {
-                                name: 'type',
-                                description: 'Type of leaderboard to show',
-                                type: 3, // STRING type
-                                required: false,
-                                choices: [
-                                    { name: 'Overall XP', value: 'overall' },
-                                    { name: 'Voice Activity', value: 'voice' },
-                                    { name: 'Reactions', value: 'reactions' }
-                                ]
-                            },
-                            {
-                                name: 'limit',
-                                description: 'Number of users to show (1-25)',
-                                type: 4, // INTEGER type
-                                required: false,
-                                min_value: 1,
-                                max_value: 25
-                            }
-                        ]
-                    }
-                ];
-
-                // Register commands globally (you can also register per guild for faster updates during development)
-                await this.client.application.commands.set(commands);
-                console.log('✓ Leveling slash commands registered');
-            } catch (error) {
-                console.error('Error registering leveling slash commands:', error);
-            }
-        });
-
-        // Handle slash command interactions
-        this.client.on('interactionCreate', async (interaction) => {
-            if (!interaction.isChatInputCommand()) return;
-
-            const { commandName, guildId, user } = interaction;
-
-            if (commandName === 'level') {
-                await this.handleLevelCommand(interaction);
-            } else if (commandName === 'leaderboard') {
-                await this.handleLeaderboardCommand(interaction);
-            }
-        });
     }
 
     async handleLevelCommand(interaction) {
@@ -968,14 +627,14 @@ class LevelingPlugin {
             const progressPercentage = Math.floor((xpProgress / xpForNextLevel) * 100);
 
             const embed = {
-                color: 0x7289da,
+                color: 0x4f46e5,
                 title: `${targetUser.username}'s Level`,
                 thumbnail: { url: targetUser.displayAvatarURL() },
                 fields: [
                     { name: '📊 Level', value: userData.level.toString(), inline: true },
-                    { name: '⭐ Total XP', value: userData.xp.toString(), inline: true },
-                    { name: '🎯 XP to Next Level', value: xpNeeded.toString(), inline: true },
-                    { name: '📈 Progress', value: `${xpProgress}/${xpForNextLevel} (${progressPercentage}%)`, inline: false }
+                    { name: '⭐ Total XP', value: userData.xp.toLocaleString(), inline: true },
+                    { name: '🎯 XP to Next Level', value: xpNeeded.toLocaleString(), inline: true },
+                    { name: '📈 Progress', value: `${xpProgress.toLocaleString()}/${xpForNextLevel.toLocaleString()} (${progressPercentage}%)`, inline: false }
                 ],
                 footer: { text: `Voice: ${userData.voiceTime}min | Reactions: ${userData.reactionsGiven + userData.reactionsReceived}` }
             };
@@ -1039,7 +698,7 @@ class LevelingPlugin {
                             valueText = `${entry.value} reactions`;
                             break;
                         default:
-                            valueText = `${entry.value} XP (Level ${entry.level})`;
+                            valueText = `${entry.value.toLocaleString()} XP (Level ${entry.level})`;
                     }
                     
                     return `${emoji} **${entry.rank}.** ${entry.username} - ${valueText}`;
@@ -1053,7 +712,7 @@ class LevelingPlugin {
             };
 
             const embed = {
-                color: 0x00ff00,
+                color: 0x22c55e,
                 title: `🏆 ${typeNames[type]} Leaderboard`,
                 description: leaderboardText,
                 footer: { text: `Showing top ${enrichedLeaderboard.length} users` }
@@ -1068,693 +727,613 @@ class LevelingPlugin {
 
     getFrontendComponent() {
         return {
-            // Plugin identification
-            id: 'leveling-plugin',
+            id: 'leveling-system',
             name: 'Leveling System',
-            description: 'Configure XP sources, view leaderboards, and manage user levels',
+            description: 'XP and leveling system with multiple sources and leaderboards',
             icon: '📈',
-            version: '1.0.0',
-            
-            // Plugin targets
             containerId: 'levelingPluginContainer',
-            pageId: 'leveling',
-            navIcon: '📈',
-            
-            // Complete HTML and script
             html: `
                 <div class="plugin-container">
-                    <div class="plugin-header">
-                        <h3><span class="plugin-icon">📈</span> Leveling System</h3>
-                        <p>Configure XP sources, view leaderboards, and manage user levels</p>
+                    <div class="page-header">
+                        <div>
+                            <h1 class="page-title">Leveling System</h1>
+                            <p class="page-subtitle">Configure XP sources, view leaderboards, and manage user levels</p>
+                        </div>
+                        <div class="btn-group">
+                            <button id="exportLevelingData" class="btn btn-secondary">
+                                <span class="btn-icon">📤</span>
+                                Export Data
+                            </button>
+                        </div>
                     </div>
 
-                    <div class="settings-section">
-                        <h3>Settings</h3>
-                        <div class="form-group">
-                            <label for="levelingServerSelect">Server</label>
-                            <select id="levelingServerSelect" required>
-                                <option value="">Select a server...</option>
-                            </select>
+                    <!-- Statistics Cards -->
+                    <div class="stats-section">
+                        <div class="stats-grid" id="levelingStatsGrid">
+                            <div class="stat-card">
+                                <div class="stat-icon" style="background: linear-gradient(135deg, #4f46e5, #7c3aed);">📊</div>
+                                <div class="stat-content">
+                                    <div class="stat-value" id="activeUsersCount">0</div>
+                                    <div class="stat-label">Active Users</div>
+                                </div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-icon" style="background: linear-gradient(135deg, #22c55e, #16a34a);">⭐</div>
+                                <div class="stat-content">
+                                    <div class="stat-value" id="totalXPCount">0</div>
+                                    <div class="stat-label">Total XP</div>
+                                </div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-icon" style="background: linear-gradient(135deg, #f59e0b, #d97706);">🎯</div>
+                                <div class="stat-content">
+                                    <div class="stat-value" id="maxLevelCount">0</div>
+                                    <div class="stat-label">Highest Level</div>
+                                </div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-icon" style="background: linear-gradient(135deg, #ef4444, #dc2626);">🎤</div>
+                                <div class="stat-content">
+                                    <div class="stat-value" id="voiceTimeCount">0</div>
+                                    <div class="stat-label">Voice Minutes</div>
+                                </div>
+                            </div>
                         </div>
+                    </div>
 
-                        <div id="levelingSettingsContainer" style="display: none;">
-                            <div class="form-group">
-                                <label>XP Sources</label>
-                                <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 12px; background: rgba(255,255,255,0.05); border-radius: 8px; padding: 15px;">
-                                    <label style="display: flex; align-items: flex-start; gap: 12px; cursor: pointer;">
-                                        <input type="checkbox" id="xpSourceMessages" style="margin-top: 3px; transform: scale(1.1);">
-                                        <div>
-                                            <div style="font-weight: 500; margin-bottom: 2px;">Messages</div>
-                                            <div style="opacity: 0.7; font-size: 0.9em;">15-25 XP per message, 1 min cooldown</div>
+                    <!-- Settings Section -->
+                    <div class="widget">
+                        <div class="widget-header">
+                            <h3>⚙️ Leveling Settings</h3>
+                            <div class="widget-controls">
+                                <span id="levelingStatus" class="status-badge status-inactive">Disabled</span>
+                            </div>
+                        </div>
+                        <div class="widget-content">
+                            <form id="levelingSettingsForm">
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>XP Sources</label>
+                                        <div class="checkbox-group">
+                                            <div class="checkbox-group-item">
+                                                <input type="checkbox" id="xpSourceMessages" name="xpSources.messages">
+                                                <label for="xpSourceMessages" class="checkbox-label">💬 Messages (10-25 XP)</label>
+                                            </div>
+                                            <div class="checkbox-group-item">
+                                                <input type="checkbox" id="xpSourceVoice" name="xpSources.voice">
+                                                <label for="xpSourceVoice" class="checkbox-label">🎤 Voice Activity (1 XP/min)</label>
+                                            </div>
+                                            <div class="checkbox-group-item">
+                                                <input type="checkbox" id="xpSourceReactions" name="xpSources.reactions">
+                                                <label for="xpSourceReactions" class="checkbox-label">😄 Reactions (2 XP each)</label>
+                                            </div>
                                         </div>
-                                    </label>
-                                    <label style="display: flex; align-items: flex-start; gap: 12px; cursor: pointer;">
-                                        <input type="checkbox" id="xpSourceVoice" style="margin-top: 3px; transform: scale(1.1);">
-                                        <div>
-                                            <div style="font-weight: 500; margin-bottom: 2px;">Voice Activity</div>
-                                            <div style="opacity: 0.7; font-size: 0.9em;">10 XP per minute</div>
-                                        </div>
-                                    </label>
-                                    <label style="display: flex; align-items: flex-start; gap: 12px; cursor: pointer;">
-                                        <input type="checkbox" id="xpSourceReactions" style="margin-top: 3px; transform: scale(1.1);">
-                                        <div>
-                                            <div style="font-weight: 500; margin-bottom: 2px;">Reactions</div>
-                                            <div style="opacity: 0.7; font-size: 0.9em;">5 XP for giving, 3 XP for receiving</div>
-                                        </div>
-                                    </label>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="xpMultiplier">XP Multiplier</label>
+                                        <input type="number" id="xpMultiplier" name="xpMultiplier" class="form-control" 
+                                               min="0.1" max="10" step="0.1" value="1.0">
+                                        <small style="color: var(--text-muted); font-size: 12px;">Multiply all XP gains (0.1x to 10x)</small>
+                                    </div>
+                                </div>
+                                
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label for="levelUpChannel">Level Up Channel</label>
+                                        <select id="levelUpChannel" name="levelUpChannel" class="form-control">
+                                            <option value="">Select a channel...</option>
+                                        </select>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="levelUpMessage">Level Up Message</label>
+                                        <input type="text" id="levelUpMessage" name="levelUpMessage" class="form-control" 
+                                               placeholder="🎉 {user} reached level {level}!" 
+                                               value="🎉 {user} reached level {level}!">
+                                        <small style="color: var(--text-muted); font-size: 12px;">Use {user} and {level} placeholders</small>
+                                    </div>
+                                </div>
+
+                                <div class="btn-group">
+                                    <button type="submit" id="saveLevelingSettings" class="btn btn-primary">
+                                        <span class="btn-icon">💾</span>
+                                        Save Settings
+                                    </button>
+                                    <button type="button" id="resetLevelingSettings" class="btn btn-secondary">
+                                        <span class="btn-icon">🔄</span>
+                                        Reset to Defaults
+                                    </button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+
+                    <!-- Leaderboards Section -->
+                    <div class="widget">
+                        <div class="widget-header">
+                            <h3>🏆 Leaderboards</h3>
+                            <div class="leaderboard-tabs">
+                                <button class="tab-btn active" data-type="overall">Overall XP</button>
+                                <button class="tab-btn" data-type="voice">Voice Activity</button>
+                                <button class="tab-btn" data-type="reactions">Reactions</button>
+                            </div>
+                        </div>
+                        <div class="widget-content">
+                            <div id="leaderboardContent">
+                                <div id="leaderboardLoading" class="plugin-loading" style="display: none;">
+                                    Loading leaderboard...
+                                </div>
+                                <div id="leaderboardList" class="leaderboard-list"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Admin Management Section -->
+                    <div class="widget">
+                        <div class="widget-header">
+                            <h3>👑 Admin Management</h3>
+                        </div>
+                        <div class="widget-content">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="adminUserId">User ID</label>
+                                    <input type="text" id="adminUserId" class="form-control" 
+                                           placeholder="Enter Discord User ID">
+                                </div>
+                                <div class="form-group">
+                                    <label for="adminXpAmount">XP Amount</label>
+                                    <input type="number" id="adminXpAmount" class="form-control" 
+                                           placeholder="Enter XP amount" min="1">
                                 </div>
                             </div>
 
-                            <div class="form-group">
-                                <label for="levelUpChannelSelect">Level Up Notifications Channel (Optional)</label>
-                                <select id="levelUpChannelSelect">
-                                    <option value="">No notifications</option>
-                                </select>
-                                <small style="opacity: 0.7; display: block; margin-top: 4px;">
-                                    Choose where level up notifications will be sent
-                                </small>
-                            </div>
-
-                            <div class="form-group">
-                                <label for="xpMultiplier">XP Multiplier</label>
-                                <input type="number" id="xpMultiplier" min="0.1" max="10" step="0.1" value="1.0">
-                                <small style="opacity: 0.7; display: block; margin-top: 4px;">
-                                    Multiply all XP gains by this amount (0.1x to 10x)
-                                </small>
-                            </div>
-
-                            <button type="button" id="saveLevelingSettings" class="btn-primary">
-                                <span class="btn-text">Save Settings</span>
-                                <span class="btn-loader" style="display: none;">Saving...</span>
-                            </button>
-                        </div>
-                    </div>
-
-                    <div id="leaderboardSection" style="display: none;">
-                        <h3>Leaderboards</h3>
-                        <div style="display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap;">
-                            <button type="button" class="leaderboard-btn active" data-type="overall" style="padding: 8px 16px; background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); border-radius: 8px; color: white; cursor: pointer;">
-                                Overall XP
-                            </button>
-                            <button type="button" class="leaderboard-btn" data-type="voice" style="padding: 8px 16px; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; color: white; cursor: pointer;">
-                                Voice Activity
-                            </button>
-                            <button type="button" class="leaderboard-btn" data-type="reactions" style="padding: 8px 16px; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; color: white; cursor: pointer;">
-                                Reactions
-                            </button>
-                        </div>
-
-                        <div id="leaderboardContent" style="background: rgba(255,255,255,0.05); border-radius: 8px; padding: 15px; min-height: 200px;">
-                            <div id="leaderboardLoading" style="text-align: center; opacity: 0.6; padding: 40px;">
-                                Loading leaderboard...
-                            </div>
-                            <div id="leaderboardList" style="display: none;"></div>
-                        </div>
-                    </div>
-
-                    <div id="adminSection" style="display: none;">
-                        <h3>Admin Tools</h3>
-                        <div style="background: rgba(255,255,255,0.05); border-radius: 8px; padding: 15px;">
-                            <div class="form-group">
-                                <label for="adminUserId">User ID</label>
-                                <input type="text" id="adminUserId" placeholder="Enter Discord User ID...">
-                            </div>
-                            <div class="form-group">
-                                <label for="adminXpAmount">XP Amount</label>
-                                <input type="number" id="adminXpAmount" placeholder="Amount of XP to add..." min="1">
-                            </div>
-                            <button type="button" id="addXpBtn" style="padding: 8px 16px; background: rgba(76, 175, 80, 0.3); border: 1px solid rgba(76, 175, 80, 0.5); border-radius: 8px; color: white; cursor: pointer;">
-                                Add XP
-                            </button>
-                        </div>
-                    </div>
-					
-					<div id="backupSection" style="display: none;">
-						<h3>💾 Backup Management</h3>
-						<div style="background: rgba(255,255,255,0.05); border-radius: 8px; padding: 15px; margin-bottom: 15px;">
-							<div style="display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap;">
-								<button type="button" id="createBackupBtn" style="padding: 8px 16px; background: rgba(76, 175, 80, 0.3); border: 1px solid rgba(76, 175, 80, 0.5); border-radius: 8px; color: white; cursor: pointer;">
-									📁 Create Backup Now
-								</button>
-								<button type="button" id="refreshBackupsBtn" style="padding: 8px 16px; background: rgba(33, 150, 243, 0.3); border: 1px solid rgba(33, 150, 243, 0.5); border-radius: 8px; color: white; cursor: pointer;">
-									🔄 Refresh List
-								</button>
-								<button type="button" id="syncDataBtn" style="padding: 8px 16px; background: rgba(255, 193, 7, 0.3); border: 1px solid rgba(255, 193, 7, 0.5); border-radius: 8px; color: white; cursor: pointer;">
-									⚙️ Validate Data
-								</button>
-							</div>
-							
-							<div style="margin-bottom: 10px;">
-								<label for="backupReason" style="display: block; margin-bottom: 5px; color: white;">Backup Reason (Optional):</label>
-								<input type="text" id="backupReason" placeholder="e.g., Before major changes..." style="width: 100%; padding: 8px; border: 1px solid rgba(255,255,255,0.3); border-radius: 6px; background: rgba(255,255,255,0.1); color: white;">
-							</div>
-						</div>
-
-						<div id="backupListContainer" style="background: rgba(255,255,255,0.05); border-radius: 8px; padding: 15px;">
-							<h4 style="color: white; margin-top: 0;">📋 Available Backups</h4>
-							<div id="backupLoading" style="text-align: center; opacity: 0.6; padding: 20px;">
-								Loading backups...
-							</div>
-							<div id="backupList" style="display: none;"></div>
-							<div id="backupEmpty" style="display: none; text-align: center; opacity: 0.6; padding: 20px;">
-								No backups available
-							</div>
-						</div>
-
-						<div style="background: rgba(255, 193, 7, 0.1); border: 1px solid rgba(255, 193, 7, 0.3); border-radius: 8px; padding: 15px; margin-top: 15px;">
-							<h4 style="color: #ffc107; margin-top: 0;">⚙️ Automatic Backup Settings</h4>
-							<ul style="color: rgba(255,255,255,0.8); margin: 0; padding-left: 20px;">
-								<li>🕐 <strong>Periodic backups:</strong> Every 30 minutes</li>
-								<li>🌅 <strong>Daily backups:</strong> Every day at 3:00 AM</li>
-								<li>💾 <strong>Backup retention:</strong> Last 50 backups kept</li>
-								<li>🛡️ <strong>Auto-restore:</strong> Enabled on data corruption</li>
-								<li>✅ <strong>Level preservation:</strong> Backed up levels are preserved exactly</li>
-							</ul>
-						</div>
-					</div>
-
-                    <div class="info-section">
-                        <h3>Available Commands</h3>
-                        <div style="background: rgba(255,255,255,0.05); border-radius: 12px; padding: 20px; border: 1px solid rgba(255,255,255,0.1);">
-                            <div style="margin-bottom: 15px;">
-                                <code style="background: rgba(0, 0, 0, 0.3); color: #64B5F6; padding: 6px 10px; border-radius: 6px;">/level [@user]</code>
-                                <span style="color: rgba(255, 255, 255, 0.8); margin-left: 10px;">Check your or someone else's level and XP</span>
-                            </div>
-                            <div>
-                                <code style="background: rgba(0, 0, 0, 0.3); color: #64B5F6; padding: 6px 10px; border-radius: 6px;">/leaderboard [type] [limit]</code>
-                                <span style="color: rgba(255, 255, 255, 0.8); margin-left: 10px;">View server leaderboards (overall, voice, reactions)</span>
+                            <div class="btn-group">
+                                <button id="addXpBtn" class="btn btn-success" data-action="add">
+                                    <span class="btn-icon">➕</span>
+                                    Add XP
+                                </button>
+                                <button id="removeXpBtn" class="btn btn-warning" data-action="remove">
+                                    <span class="btn-icon">➖</span>
+                                    Remove XP
+                                </button>
+                                <button id="setXpBtn" class="btn btn-danger" data-action="set">
+                                    <span class="btn-icon">🎯</span>
+                                    Set XP
+                                </button>
                             </div>
                         </div>
                     </div>
                 </div>
             `,
             script: `
-                // Leveling Plugin Frontend Logic
                 (function() {
-                    const levelingServerSelect = document.getElementById('levelingServerSelect');
-                    const levelingSettingsContainer = document.getElementById('levelingSettingsContainer');
-                    const leaderboardSection = document.getElementById('leaderboardSection');
-                    const adminSection = document.getElementById('adminSection');
-                    const backupSection = document.getElementById('backupSection');
-                    const xpSourceMessages = document.getElementById('xpSourceMessages');
-                    const xpSourceVoice = document.getElementById('xpSourceVoice');
-                    const xpSourceReactions = document.getElementById('xpSourceReactions');
-                    const levelUpChannelSelect = document.getElementById('levelUpChannelSelect');
-                    const xpMultiplier = document.getElementById('xpMultiplier');
-                    const saveLevelingSettings = document.getElementById('saveLevelingSettings');
+                    // Plugin state
+                    let currentServerId = null;
+                    let currentLeaderboardType = 'overall';
+                    let settings = {};
+                    
+                    // DOM elements
+                    const serverSelect = window.serverSelect;
+                    const levelingSettingsForm = document.getElementById('levelingSettingsForm');
+                    const leaderboardTabs = document.querySelectorAll('.tab-btn');
                     const leaderboardContent = document.getElementById('leaderboardContent');
                     const leaderboardLoading = document.getElementById('leaderboardLoading');
                     const leaderboardList = document.getElementById('leaderboardList');
+                    const exportButton = document.getElementById('exportLevelingData');
+                    const resetButton = document.getElementById('resetLevelingSettings');
+                    
+                    // XP management buttons
+                    const addXpBtn = document.getElementById('addXpBtn');
+                    const removeXpBtn = document.getElementById('removeXpBtn');
+                    const setXpBtn = document.getElementById('setXpBtn');
                     const adminUserId = document.getElementById('adminUserId');
                     const adminXpAmount = document.getElementById('adminXpAmount');
-                    const addXpBtn = document.getElementById('addXpBtn');
-                    const btnText = saveLevelingSettings ? saveLevelingSettings.querySelector('.btn-text') : null;
-                    const btnLoader = saveLevelingSettings ? saveLevelingSettings.querySelector('.btn-loader') : null;
-                    
-                    // Backup elements
-                    const createBackupBtn = document.getElementById('createBackupBtn');
-                    const refreshBackupsBtn = document.getElementById('refreshBackupsBtn');
-                    const syncDataBtn = document.getElementById('syncDataBtn');
-                    const backupReason = document.getElementById('backupReason');
-                    const backupLoading = document.getElementById('backupLoading');
-                    const backupList = document.getElementById('backupList');
-                    const backupEmpty = document.getElementById('backupEmpty');
-                    
-                    let currentGuildId = null;
-                    let currentLeaderboardType = 'overall';
-                    
-                    // Initialize if elements exist
-                    if (levelingServerSelect) {
-                        levelingServerSelect.addEventListener('change', function() {
-                            currentGuildId = this.value;
-                            if (currentGuildId) {
-                                loadLevelingSettings();
-                                loadLevelingChannels();
-                                loadLeaderboard();
-                                loadBackups();
-                                if (levelingSettingsContainer) levelingSettingsContainer.style.display = 'block';
-                                if (leaderboardSection) leaderboardSection.style.display = 'block';
-                                if (adminSection) adminSection.style.display = 'block';
-                                if (backupSection) backupSection.style.display = 'block';
-                            } else {
-                                if (levelingSettingsContainer) levelingSettingsContainer.style.display = 'none';
-                                if (leaderboardSection) leaderboardSection.style.display = 'none';
-                                if (adminSection) adminSection.style.display = 'none';
-                                if (backupSection) backupSection.style.display = 'none';
+
+                    // Initialize plugin
+                    function init() {
+                        setupEventListeners();
+                        loadInitialData();
+                    }
+
+                    function setupEventListeners() {
+                        // Server selection
+                        if (serverSelect) {
+                            serverSelect.addEventListener('change', handleServerChange);
+                        }
+
+                        // Settings form
+                        if (levelingSettingsForm) {
+                            levelingSettingsForm.addEventListener('submit', handleSettingsSave);
+                        }
+
+                        // Leaderboard tabs
+                        leaderboardTabs.forEach(tab => {
+                            tab.addEventListener('click', handleLeaderboardTabChange);
+                        });
+
+                        // Export button
+                        if (exportButton) {
+                            exportButton.addEventListener('click', handleExportData);
+                        }
+
+                        // Reset button
+                        if (resetButton) {
+                            resetButton.addEventListener('click', handleResetSettings);
+                        }
+
+                        // XP management buttons
+                        [addXpBtn, removeXpBtn, setXpBtn].forEach(btn => {
+                            if (btn) {
+                                btn.addEventListener('click', handleXpManagement);
                             }
                         });
-                        loadLevelingServers();
+
+                        // Real-time updates
+                        setInterval(updateStats, 30000); // Update stats every 30 seconds
                     }
-                    
-                    if (saveLevelingSettings) {
-                        saveLevelingSettings.addEventListener('click', saveLevelingSettings_internal);
+
+                    async function loadInitialData() {
+                        currentServerId = serverSelect?.value;
+                        if (!currentServerId) return;
+
+                        await Promise.all([
+                            loadSettings(),
+                            loadStats(),
+                            loadChannels(),
+                            loadLeaderboard()
+                        ]);
                     }
-                    
-                    if (addXpBtn) {
-                        addXpBtn.addEventListener('click', addXPToUser);
+
+                    async function handleServerChange() {
+                        currentServerId = serverSelect.value;
+                        if (!currentServerId) return;
+
+                        showNotification('Loading server data...', 'info');
+                        await loadInitialData();
                     }
-                    
-                    if (createBackupBtn) {
-                        createBackupBtn.addEventListener('click', createManualBackup);
-                    }
-                    
-                    if (refreshBackupsBtn) {
-                        refreshBackupsBtn.addEventListener('click', loadBackups);
-                    }
-                    
-                    if (syncDataBtn) {
-                        syncDataBtn.addEventListener('click', syncUserData);
-                    }
-                    
-                    // Leaderboard type buttons
-                    const leaderboardBtns = document.querySelectorAll('.leaderboard-btn');
-                    leaderboardBtns.forEach(btn => {
-                        btn.addEventListener('click', function() {
-                            leaderboardBtns.forEach(b => {
-                                b.style.background = 'rgba(255,255,255,0.1)';
-                                b.style.borderColor = 'rgba(255,255,255,0.2)';
-                                b.classList.remove('active');
-                            });
-                            this.style.background = 'rgba(255,255,255,0.2)';
-                            this.style.borderColor = 'rgba(255,255,255,0.3)';
-                            this.classList.add('active');
-                            currentLeaderboardType = this.dataset.type;
-                            loadLeaderboard();
-                        });
-                    });
-                    
-                    async function loadLevelingServers() {
+
+                    async function loadSettings() {
+                        if (!currentServerId) return;
+
                         try {
-                            const response = await fetch('/api/servers');
-                            const servers = await response.json();
-                            
-                            if (levelingServerSelect) {
-                                levelingServerSelect.innerHTML = '<option value="">Select a server...</option>';
-                                servers.forEach(server => {
-                                    const option = document.createElement('option');
-                                    option.value = server.id;
-                                    option.textContent = server.name;
-                                    levelingServerSelect.appendChild(option);
-                                });
-                            }
+                            const response = await fetch(\`/api/plugins/leveling/settings/\${currentServerId}\`);
+                            if (!response.ok) throw new Error('Failed to load settings');
+
+                            settings = await response.json();
+                            populateSettingsForm();
+                            updateStatusBadge();
                         } catch (error) {
-                            console.error('Error loading servers:', error);
-                            if (window.showNotification) {
-                                window.showNotification('Error loading servers', 'error');
-                            }
+                            console.error('Error loading settings:', error);
+                            showNotification('Failed to load settings', 'error');
                         }
                     }
-                    
-                    async function loadLevelingChannels() {
+
+                    async function loadStats() {
+                        if (!currentServerId) return;
+
                         try {
-                            if (levelUpChannelSelect) {
-                                levelUpChannelSelect.innerHTML = '<option value="">Loading...</option>';
-                                const response = await fetch(\`/api/channels/\${currentGuildId}\`);
-                                const channels = await response.json();
-                                
-                                levelUpChannelSelect.innerHTML = '<option value="">No notifications</option>';
-                                channels.forEach(channel => {
-                                    const option = document.createElement('option');
-                                    option.value = channel.id;
-                                    option.textContent = \`# \${channel.name}\`;
-                                    levelUpChannelSelect.appendChild(option);
-                                });
-                            }
+                            const response = await fetch(\`/api/plugins/leveling/stats/\${currentServerId}\`);
+                            if (!response.ok) throw new Error('Failed to load stats');
+
+                            const stats = await response.json();
+                            updateStatsDisplay(stats);
+                        } catch (error) {
+                            console.error('Error loading stats:', error);
+                        }
+                    }
+
+                    async function loadChannels() {
+                        if (!currentServerId) return;
+
+                        try {
+                            const response = await fetch(\`/api/channels/\${currentServerId}\`);
+                            if (!response.ok) throw new Error('Failed to load channels');
+
+                            const channels = await response.json();
+                            populateChannelSelect(channels);
                         } catch (error) {
                             console.error('Error loading channels:', error);
-                            if (levelUpChannelSelect) {
-                                levelUpChannelSelect.innerHTML = '<option value="">Error loading channels</option>';
-                            }
                         }
                     }
-                    
-                    async function loadLevelingSettings() {
-                        try {
-                            const response = await fetch(\`/api/plugins/leveling/settings/\${currentGuildId}\`);
-                            const settings = await response.json();
-                            
-                            if (xpSourceMessages) xpSourceMessages.checked = settings.xpSources?.messages || false;
-                            if (xpSourceVoice) xpSourceVoice.checked = settings.xpSources?.voice || false;
-                            if (xpSourceReactions) xpSourceReactions.checked = settings.xpSources?.reactions || false;
-                            if (levelUpChannelSelect && settings.levelUpChannel) {
-                                levelUpChannelSelect.value = settings.levelUpChannel;
-                            }
-                            if (xpMultiplier) xpMultiplier.value = settings.xpMultiplier || 1.0;
-                        } catch (error) {
-                            console.error('Error loading leveling settings:', error);
-                            if (window.showNotification) {
-                                window.showNotification('Error loading leveling settings', 'error');
-                            }
-                        }
-                    }
-                    
-                    async function saveLevelingSettings_internal() {
-                        if (!currentGuildId) {
-                            if (window.showNotification) {
-                                window.showNotification('Please select a server first', 'error');
-                            }
-                            return;
-                        }
-                        
-                        try {
-                            if (btnText) btnText.style.display = 'none';
-                            if (btnLoader) btnLoader.style.display = 'inline';
-                            if (saveLevelingSettings) saveLevelingSettings.disabled = true;
-                            
-                            const settings = {
-                                xpSources: {
-                                    messages: xpSourceMessages ? xpSourceMessages.checked : false,
-                                    voice: xpSourceVoice ? xpSourceVoice.checked : false,
-                                    reactions: xpSourceReactions ? xpSourceReactions.checked : false
-                                },
-                                levelUpChannel: levelUpChannelSelect ? levelUpChannelSelect.value || null : null,
-                                xpMultiplier: xpMultiplier ? parseFloat(xpMultiplier.value) || 1.0 : 1.0
-                            };
-                            
-                            const response = await fetch(\`/api/plugins/leveling/settings/\${currentGuildId}\`, {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/json'
-                                },
-                                body: JSON.stringify(settings)
-                            });
-                            
-                            const result = await response.json();
-                            
-                            if (response.ok) {
-                                if (window.showNotification) {
-                                    window.showNotification('Leveling settings saved successfully!', 'success');
-                                }
-                            } else {
-                                throw new Error(result.error || 'Failed to save settings');
-                            }
-                        } catch (error) {
-                            console.error('Error saving leveling settings:', error);
-                            if (window.showNotification) {
-                                window.showNotification(error.message, 'error');
-                            }
-                        } finally {
-                            if (btnText) btnText.style.display = 'inline';
-                            if (btnLoader) btnLoader.style.display = 'none';
-                            if (saveLevelingSettings) saveLevelingSettings.disabled = false;
-                        }
-                    }
-                    
+
                     async function loadLeaderboard() {
-                        if (!currentGuildId) return;
-                        
+                        if (!currentServerId) return;
+
+                        leaderboardLoading.style.display = 'block';
+                        leaderboardList.innerHTML = '';
+
                         try {
-                            if (leaderboardLoading) leaderboardLoading.style.display = 'block';
-                            if (leaderboardList) leaderboardList.style.display = 'none';
-                            
-                            const response = await fetch(\`/api/plugins/leveling/leaderboard/\${currentGuildId}/\${currentLeaderboardType}?limit=10\`);
+                            const response = await fetch(\`/api/plugins/leveling/leaderboard/\${currentServerId}?type=\${currentLeaderboardType}&limit=10\`);
+                            if (!response.ok) throw new Error('Failed to load leaderboard');
+
                             const leaderboard = await response.json();
-                            
-                            if (leaderboardList) {
-                                if (leaderboard.length === 0) {
-                                    leaderboardList.innerHTML = '<div style="text-align: center; opacity: 0.6; padding: 40px;">No data available for this leaderboard.</div>';
-                                } else {
-                                    leaderboardList.innerHTML = leaderboard.map((entry, index) => {
-                                        const rank = index + 1;
-                                        const emoji = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : '📍';
-                                        
-                                        let valueText;
-                                        switch (currentLeaderboardType) {
-                                            case 'voice':
-                                                valueText = \`\${entry.value} minutes\`;
-                                                break;
-                                            case 'reactions':
-                                                valueText = \`\${entry.value} reactions\`;
-                                                break;
-                                            default:
-                                                valueText = \`\${entry.value} XP (Level \${entry.level})\`;
-                                        }
-                                        
-                                        return \`
-                                            <div style="display: flex; align-items: center; padding: 10px; margin-bottom: 8px; background: rgba(255,255,255,0.05); border-radius: 8px;">
-                                                <span style="font-size: 1.2em; margin-right: 10px;">\${emoji}</span>
-                                                \${entry.avatar ? \`<img src="\${entry.avatar}" style="width: 32px; height: 32px; border-radius: 50%; margin-right: 10px;" alt="Avatar">\` : '<div style="width: 32px; height: 32px; background: rgba(255,255,255,0.2); border-radius: 50%; margin-right: 10px; display: flex; align-items: center; justify-content: center; font-weight: bold;">' + entry.username.charAt(0).toUpperCase() + '</div>'}
-                                                <div style="flex: 1;">
-                                                    <div style="font-weight: bold;">\${rank}. \${entry.username}</div>
-                                                    <div style="opacity: 0.7; font-size: 0.9em;">\${valueText}</div>
-                                                </div>
-                                            </div>
-                                        \`;
-                                    }).join('');
-                                }
-                                leaderboardList.style.display = 'block';
-                            }
-                            
-                            if (leaderboardLoading) leaderboardLoading.style.display = 'none';
+                            displayLeaderboard(leaderboard);
                         } catch (error) {
                             console.error('Error loading leaderboard:', error);
-                            if (leaderboardList) {
-                                leaderboardList.innerHTML = '<div style="text-align: center; color: #ff6b6b; padding: 40px;">Error loading leaderboard</div>';
-                                leaderboardList.style.display = 'block';
-                            }
-                            if (leaderboardLoading) leaderboardLoading.style.display = 'none';
-                        }
-                    }
-                    
-                    async function addXPToUser() {
-                        const userId = adminUserId ? adminUserId.value.trim() : '';
-                        const amount = adminXpAmount ? parseInt(adminXpAmount.value) : 0;
-                        
-                        if (!userId || !amount) {
-                            if (window.showNotification) {
-                                window.showNotification('Please enter both User ID and XP amount', 'error');
-                            }
-                            return;
-                        }
-                        
-                        try {
-                            const response = await fetch('/api/plugins/leveling/addxp', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({
-                                    guildId: currentGuildId,
-                                    userId: userId,
-                                    amount: amount
-                                })
-                            });
-                            
-                            const result = await response.json();
-                            
-                            if (response.ok) {
-                                if (window.showNotification) {
-                                    window.showNotification(\`Added \${amount} XP to user successfully!\`, 'success');
-                                }
-                                if (adminUserId) adminUserId.value = '';
-                                if (adminXpAmount) adminXpAmount.value = '';
-                                loadLeaderboard(); // Refresh leaderboard
-                            } else {
-                                throw new Error(result.error || 'Failed to add XP');
-                            }
-                        } catch (error) {
-                            console.error('Error adding XP:', error);
-                            if (window.showNotification) {
-                                window.showNotification(error.message, 'error');
-                            }
-                        }
-                    }
-                    
-                    async function createManualBackup() {
-                        if (!currentGuildId) {
-                            if (window.showNotification) {
-                                window.showNotification('Please select a server first', 'error');
-                            }
-                            return;
-                        }
-                        
-                        try {
-                            createBackupBtn.disabled = true;
-                            createBackupBtn.textContent = '⏳ Creating...';
-                            
-                            const reason = backupReason ? backupReason.value.trim() : '';
-                            
-                            const response = await fetch('/api/plugins/leveling/backup/create', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ reason })
-                            });
-                            
-                            const result = await response.json();
-                            
-                            if (response.ok) {
-                                if (window.showNotification) {
-                                    window.showNotification('Backup created successfully!', 'success');
-                                }
-                                if (backupReason) backupReason.value = '';
-                                loadBackups(); // Refresh the list
-                            } else {
-                                throw new Error(result.error || 'Failed to create backup');
-                            }
-                        } catch (error) {
-                            console.error('Error creating backup:', error);
-                            if (window.showNotification) {
-                                window.showNotification(error.message, 'error');
-                            }
+                            leaderboardList.innerHTML = '<div class="empty-state">Failed to load leaderboard</div>';
                         } finally {
-                            createBackupBtn.disabled = false;
-                            createBackupBtn.textContent = '📁 Create Backup Now';
+                            leaderboardLoading.style.display = 'none';
                         }
                     }
-                    
-                    async function syncUserData() {
-                        if (!currentGuildId) {
-                            if (window.showNotification) {
-                                window.showNotification('Please select a server first', 'error');
+
+                    function populateSettingsForm() {
+                        // XP Sources
+                        document.getElementById('xpSourceMessages').checked = settings.xpSources?.messages || false;
+                        document.getElementById('xpSourceVoice').checked = settings.xpSources?.voice || false;
+                        document.getElementById('xpSourceReactions').checked = settings.xpSources?.reactions || false;
+
+                        // XP Multiplier
+                        document.getElementById('xpMultiplier').value = settings.xpMultiplier || 1.0;
+
+                        // Level up channel
+                        document.getElementById('levelUpChannel').value = settings.levelUpChannel || '';
+
+                        // Level up message
+                        document.getElementById('levelUpMessage').value = settings.levelUpMessage || '🎉 {user} reached level {level}!';
+                    }
+
+                    function populateChannelSelect(channels) {
+                        const channelSelect = document.getElementById('levelUpChannel');
+                        if (!channelSelect) return;
+
+                        channelSelect.innerHTML = '<option value="">Select a channel...</option>';
+                        
+                        channels.forEach(channel => {
+                            if (channel.type === 0) { // Text channels only
+                                const option = document.createElement('option');
+                                option.value = channel.id;
+                                option.textContent = \`#\${channel.name}\`;
+                                channelSelect.appendChild(option);
                             }
+                        });
+
+                        // Set current value
+                        if (settings.levelUpChannel) {
+                            channelSelect.value = settings.levelUpChannel;
+                        }
+                    }
+
+                    function updateStatsDisplay(stats) {
+                        document.getElementById('activeUsersCount').textContent = stats.serverUsers.toLocaleString();
+                        document.getElementById('totalXPCount').textContent = stats.totalXP.toLocaleString();
+                        document.getElementById('maxLevelCount').textContent = stats.maxLevel;
+                        document.getElementById('voiceTimeCount').textContent = Math.floor(stats.totalVoiceTime).toLocaleString();
+                    }
+
+                    function updateStatusBadge() {
+                        const statusBadge = document.getElementById('levelingStatus');
+                        if (!statusBadge) return;
+
+                        const isEnabled = settings.xpSources?.messages || settings.xpSources?.voice || settings.xpSources?.reactions;
+                        
+                        if (isEnabled) {
+                            statusBadge.textContent = 'Active';
+                            statusBadge.className = 'status-badge status-active';
+                        } else {
+                            statusBadge.textContent = 'Disabled';
+                            statusBadge.className = 'status-badge status-inactive';
+                        }
+                    }
+
+                    function displayLeaderboard(leaderboard) {
+                        if (!leaderboard || leaderboard.length === 0) {
+                            leaderboardList.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🏆</div><div class="empty-state-title">No Data Available</div><div class="empty-state-description">Start gaining XP to appear on the leaderboard!</div></div>';
                             return;
                         }
-                        
-                        try {
-                            syncDataBtn.disabled = true;
-                            syncDataBtn.textContent = '⏳ Validating...';
+
+                        const leaderboardHTML = leaderboard.map(entry => {
+                            const rankEmoji = entry.rank === 1 ? '🥇' : entry.rank === 2 ? '🥈' : entry.rank === 3 ? '🥉' : '📍';
                             
-                            const response = await fetch('/api/plugins/leveling/sync', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ guildId: currentGuildId })
-                            });
-                            
-                            const result = await response.json();
-                            
-                            if (response.ok) {
-                                const message = result.changesMade 
-                                    ? 'Data validation completed with changes made'
-                                    : 'Data validation completed - no changes needed';
-                                    
-                                if (window.showNotification) {
-                                    window.showNotification(message, 'success');
-                                }
-                                loadLeaderboard(); // Refresh leaderboard
-                            } else {
-                                throw new Error(result.error || 'Failed to sync data');
+                            let valueText;
+                            switch (currentLeaderboardType) {
+                                case 'voice':
+                                    valueText = \`\${entry.value} minutes\`;
+                                    break;
+                                case 'reactions':
+                                    valueText = \`\${entry.value} reactions\`;
+                                    break;
+                                default:
+                                    valueText = \`\${entry.value.toLocaleString()} XP\`;
                             }
-                        } catch (error) {
-                            console.error('Error syncing data:', error);
-                            if (window.showNotification) {
-                                window.showNotification(error.message, 'error');
-                            }
-                        } finally {
-                            syncDataBtn.disabled = false;
-                            syncDataBtn.textContent = '⚙️ Validate Data';
-                        }
-                    }
-                    
-                    async function loadBackups() {
-                        try {
-                            if (backupLoading) backupLoading.style.display = 'block';
-                            if (backupList) backupList.style.display = 'none';
-                            if (backupEmpty) backupEmpty.style.display = 'none';
-                            
-                            const response = await fetch('/api/plugins/leveling/backup/list');
-                            const backups = await response.json();
-                            
-                            if (backupList) {
-                                if (backups.length === 0) {
-                                    backupEmpty.style.display = 'block';
-                                } else {
-                                    backupList.innerHTML = backups.map(backup => {
-                                        const date = new Date(backup.created).toLocaleString();
-                                        const size = (backup.size / 1024).toFixed(1) + ' KB';
-                                        const type = backup.metadata?.type || 'unknown';
-                                        const reason = backup.metadata?.reason || 'No reason provided';
-                                        const userCount = backup.metadata?.userCount || 'Unknown';
-                                        
-                                        const typeColors = {
-                                            manual: '#4CAF50',
-                                            periodic: '#2196F3',
-                                            daily: '#FF9800',
-                                            startup: '#9C27B0',
-                                            'pre-save': '#607D8B',
-                                            'pre-restore': '#795548'
-                                        };
-                                        
-                                        const typeColor = typeColors[type] || '#666';
-                                        
-                                        return \`
-                                            <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px; margin-bottom: 8px; background: rgba(255,255,255,0.05); border-radius: 8px; border-left: 4px solid \${typeColor};">
-                                                <div style="flex: 1;">
-                                                    <div style="font-weight: bold; color: white; margin-bottom: 4px;">
-                                                        \${backup.filename}
-                                                    </div>
-                                                    <div style="font-size: 0.85em; opacity: 0.7; margin-bottom: 2px;">
-                                                        📅 \${date} | 📊 \${size} | 👥 \${userCount} users
-                                                    </div>
-                                                    <div style="font-size: 0.8em; opacity: 0.6;">
-                                                        <span style="background: \${typeColor}; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75em; margin-right: 8px;">
-                                                            \${type.toUpperCase()}
-                                                        </span>
-                                                        \${reason}
-                                                    </div>
-                                                </div>
-                                                <div style="display: flex; gap: 8px;">
-                                                    <button type="button" onclick="window.restoreBackup('\${backup.filename}')" style="padding: 6px 12px; background: rgba(255, 193, 7, 0.3); border: 1px solid rgba(255, 193, 7, 0.5); border-radius: 6px; color: white; cursor: pointer; font-size: 0.85em;">
-                                                        🔄 Restore
-                                                    </button>
-                                                </div>
+
+                            return \`
+                                <div class="leaderboard-item">
+                                    <div class="rank">\${rankEmoji}</div>
+                                    <div class="member-info">
+                                        <div class="member-avatar">
+                                            \${entry.avatar ? \`<img src="\${entry.avatar}" alt="\${entry.displayName}">\` : entry.displayName.charAt(0).toUpperCase()}
+                                        </div>
+                                        <div class="member-details">
+                                            <div class="member-name">\${entry.displayName}</div>
+                                            <div class="member-stats">\${valueText}</div>
+                                        </div>
+                                    </div>
+                                    \${currentLeaderboardType === 'overall' ? \`
+                                        <div class="member-progress">
+                                            <div class="progress-bar">
+                                                <div class="progress-fill" style="width: \${entry.progressToNext}%"></div>
                                             </div>
-                                        \`;
-                                    }).join('');
-                                    backupList.style.display = 'block';
-                                }
-                            }
-                            
-                            if (backupLoading) backupLoading.style.display = 'none';
-                        } catch (error) {
-                            console.error('Error loading backups:', error);
-                            if (backupList) {
-                                backupList.innerHTML = '<div style="text-align: center; color: #ff6b6b; padding: 20px;">Error loading backups</div>';
-                                backupList.style.display = 'block';
-                            }
-                            if (backupLoading) backupLoading.style.display = 'none';
-                        }
+                                            <small style="color: var(--text-muted); font-size: 11px;">Level \${entry.level}</small>
+                                        </div>
+                                    \` : ''}
+                                </div>
+                            \`;
+                        }).join('');
+
+                        leaderboardList.innerHTML = leaderboardHTML;
                     }
-                    
-                    // ✅ FIXED: Global function for restore button with level preservation warning
-                    window.restoreBackup = async function(filename) {
-                        if (!confirm(\`⚠️ IMPORTANT: Are you sure you want to restore from backup "\${filename}"? 
 
-This will:
-• Overwrite ALL current leveling data
-• Restore levels EXACTLY as they were backed up
-• Create a backup of current state first
-• Preserve all backed-up user levels without recalculation
+                    async function handleSettingsSave(e) {
+                        e.preventDefault();
+                        if (!currentServerId) return;
 
-This action cannot be undone (except by restoring another backup).\`)) {
-                            return;
-                        }
+                        const formData = new FormData(levelingSettingsForm);
+                        const saveButton = document.getElementById('saveLevelingSettings');
                         
+                        // Show loading state
+                        saveButton.disabled = true;
+                        saveButton.innerHTML = '<span class="btn-icon">⏳</span> Saving...';
+
                         try {
-                            const response = await fetch('/api/plugins/leveling/backup/restore', {
+                            const settingsData = {
+                                xpSources: {
+                                    messages: formData.get('xpSources.messages') === 'on',
+                                    voice: formData.get('xpSources.voice') === 'on',
+                                    reactions: formData.get('xpSources.reactions') === 'on'
+                                },
+                                xpMultiplier: parseFloat(formData.get('xpMultiplier')) || 1.0,
+                                levelUpChannel: formData.get('levelUpChannel') || null,
+                                levelUpMessage: formData.get('levelUpMessage') || '🎉 {user} reached level {level}!'
+                            };
+
+                            const response = await fetch(\`/api/plugins/leveling/settings/\${currentServerId}\`, {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ 
-                                    filename: filename,
-                                    guildId: currentGuildId 
-                                })
+                                body: JSON.stringify(settingsData)
                             });
-                            
-                            const result = await response.json();
-                            
-                            if (response.ok) {
-                                if (window.showNotification) {
-                                    window.showNotification(\`✅ Successfully restored from \${filename}! Levels preserved exactly as backed up.\`, 'success');
-                                }
-                                loadBackups(); // Refresh the list
-                                loadLeaderboard(); // Refresh leaderboard if visible
-                            } else {
-                                throw new Error(result.error || 'Failed to restore backup');
-                            }
+
+                            if (!response.ok) throw new Error('Failed to save settings');
+
+                            settings = { ...settings, ...settingsData };
+                            updateStatusBadge();
+                            showNotification('Settings saved successfully!', 'success');
                         } catch (error) {
-                            console.error('Error restoring backup:', error);
-                            if (window.showNotification) {
-                                window.showNotification(error.message, 'error');
-                            }
+                            console.error('Error saving settings:', error);
+                            showNotification('Failed to save settings', 'error');
+                        } finally {
+                            saveButton.disabled = false;
+                            saveButton.innerHTML = '<span class="btn-icon">💾</span> Save Settings';
                         }
-                    };
+                    }
+
+                    function handleLeaderboardTabChange(e) {
+                        // Remove active class from all tabs
+                        leaderboardTabs.forEach(tab => tab.classList.remove('active'));
+                        
+                        // Add active class to clicked tab
+                        e.target.classList.add('active');
+                        
+                        // Update current type and reload leaderboard
+                        currentLeaderboardType = e.target.dataset.type;
+                        loadLeaderboard();
+                    }
+
+                    async function handleExportData() {
+                        if (!currentServerId) return;
+
+                        try {
+                            exportButton.disabled = true;
+                            exportButton.innerHTML = '<span class="btn-icon">⏳</span> Exporting...';
+
+                            const response = await fetch(\`/api/plugins/leveling/export/\${currentServerId}\`);
+                            if (!response.ok) throw new Error('Failed to export data');
+
+                            const blob = await response.blob();
+                            const url = window.URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = url;
+                            a.download = \`leveling-data-\${currentServerId}-\${Date.now()}.json\`;
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
+                            window.URL.revokeObjectURL(url);
+
+                            showNotification('Data exported successfully!', 'success');
+                        } catch (error) {
+                            console.error('Error exporting data:', error);
+                            showNotification('Failed to export data', 'error');
+                        } finally {
+                            exportButton.disabled = false;
+                            exportButton.innerHTML = '<span class="btn-icon">📤</span> Export Data';
+                        }
+                    }
+
+                    function handleResetSettings() {
+                        if (!confirm('Are you sure you want to reset all settings to defaults? This cannot be undone.')) {
+                            return;
+                        }
+
+                        // Reset form to defaults
+                        document.getElementById('xpSourceMessages').checked = true;
+                        document.getElementById('xpSourceVoice').checked = true;
+                        document.getElementById('xpSourceReactions').checked = true;
+                        document.getElementById('xpMultiplier').value = 1.0;
+                        document.getElementById('levelUpChannel').value = '';
+                        document.getElementById('levelUpMessage').value = '🎉 {user} reached level {level}!';
+
+                        showNotification('Settings reset to defaults. Remember to save!', 'info');
+                    }
+
+                    async function handleXpManagement(e) {
+                        const action = e.target.closest('button').dataset.action;
+                        const userId = adminUserId.value.trim();
+                        const amount = parseInt(adminXpAmount.value);
+
+                        if (!userId || !amount || amount < 1) {
+                            showNotification('Please enter a valid User ID and XP amount', 'error');
+                            return;
+                        }
+
+                        if (!currentServerId) {
+                            showNotification('Please select a server first', 'error');
+                            return;
+                        }
+
+                        const button = e.target.closest('button');
+                        const originalHTML = button.innerHTML;
+                        button.disabled = true;
+                        button.innerHTML = '<span class="btn-icon">⏳</span> Processing...';
+
+                        try {
+                            const response = await fetch(\`/api/plugins/leveling/manage-xp/\${currentServerId}\`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ userId, amount, action })
+                            });
+
+                            const result = await response.json();
+
+                            if (!response.ok) {
+                                throw new Error(result.error || 'Failed to manage XP');
+                            }
+
+                            showNotification(result.message, 'success');
+                            
+                            // Clear form
+                            adminUserId.value = '';
+                            adminXpAmount.value = '';
+                            
+                            // Refresh stats and leaderboard
+                            await Promise.all([loadStats(), loadLeaderboard()]);
+                        } catch (error) {
+                            console.error('Error managing XP:', error);
+                            showNotification(error.message || 'Failed to manage XP', 'error');
+                        } finally {
+                            button.disabled = false;
+                            button.innerHTML = originalHTML;
+                        }
+                    }
+
+                    async function updateStats() {
+                        if (currentServerId) {
+                            await loadStats();
+                        }
+                    }
+
+                    // Helper function for notifications
+                    function showNotification(message, type = 'info') {
+                        if (window.dashboardAPI?.showNotification) {
+                            window.dashboardAPI.showNotification(message, type);
+                        } else {
+                            console.log(\`[\${type.toUpperCase()}] \${message}\`);
+                        }
+                    }
+
+                    // Initialize plugin when DOM is ready
+                    if (document.readyState === 'loading') {
+                        document.addEventListener('DOMContentLoaded', init);
+                    } else {
+                        init();
+                    }
                 })();
             `
         };

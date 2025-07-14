@@ -6,7 +6,7 @@ class MessagePlugin {
     constructor(app, client, ensureAuthenticated, hasAdminPermissions) {
         this.name = 'Message Sender';
         this.description = 'Send messages to Discord channels with optional attachments, replies, emojis, and stickers';
-        this.version = '1.0.0';
+        this.version = '1.1.0';
         this.enabled = true;
         
         this.app = app;
@@ -70,18 +70,15 @@ class MessagePlugin {
                     format: sticker.format
                 }));
                 
-                res.json({
-                    emojis: emojis,
-                    stickers: stickers
-                });
+                res.json({ emojis, stickers });
             } catch (error) {
-                console.error('Error fetching emojis and stickers:', error);
-                res.status(500).json({ error: 'Failed to fetch emojis and stickers' });
+                console.error('Error fetching emojis/stickers:', error);
+                res.status(500).json({ error: 'Failed to fetch emojis/stickers' });
             }
         });
 
-        // API endpoint for fetching message details (for replies)
-        this.app.get('/api/plugins/message/:channelId/:messageId', this.ensureAuthenticated, async (req, res) => {
+        // API endpoint for fetching a specific message (for replies)
+        this.app.get('/api/plugins/message/fetch/:channelId/:messageId', this.ensureAuthenticated, async (req, res) => {
             try {
                 const { channelId, messageId } = req.params;
                 
@@ -89,28 +86,24 @@ class MessagePlugin {
                 if (!channel) {
                     return res.status(404).json({ error: 'Channel not found' });
                 }
-
-                const hasAdmin = await this.hasAdminPermissions(req.user.id, channel.guild.id);
-                if (!hasAdmin) {
-                    return res.status(403).json({ error: 'No admin permissions' });
-                }
-
+                
                 const message = await channel.messages.fetch(messageId);
-                if (!message) {
-                    return res.status(404).json({ error: 'Message not found' });
-                }
-
+                
                 res.json({
                     id: message.id,
                     content: message.content,
                     author: {
                         username: message.author.username,
-                        displayName: message.author.displayName,
                         avatar: message.author.displayAvatarURL()
                     },
                     createdAt: message.createdAt.toISOString(),
                     channelName: channel.name,
-                    guildName: channel.guild.name
+                    guildName: message.guild?.name,
+                    attachments: message.attachments.map(att => ({
+                        name: att.name,
+                        url: att.url,
+                        size: att.size
+                    }))
                 });
             } catch (error) {
                 console.error('Error fetching message:', error);
@@ -121,7 +114,7 @@ class MessagePlugin {
             }
         });
 
-        // API endpoint for sending messages
+        // Enhanced API endpoint for sending messages with full functionality
         this.app.post('/api/plugins/message/send', this.ensureAuthenticated, upload.array('attachments'), async (req, res) => {
             try {
                 const { serverId, channelId, message, replyToMessageId, stickerId } = req.body;
@@ -178,9 +171,88 @@ class MessagePlugin {
                 }
                 
                 // Send the message
-                await channel.send(messageOptions);
+                const sentMessage = await channel.send(messageOptions);
                 
                 // Clean up uploaded files
+                if (files) {
+                    files.forEach(file => {
+                        fs.unlink(file.path, (err) => {
+                            if (err) console.error('Error deleting file:', err);
+                        });
+                    });
+                }
+                
+                res.json({ 
+                    success: true, 
+                    message: 'Message sent successfully',
+                    messageId: sentMessage.id,
+                    channelName: channel.name,
+                    guildName: channel.guild?.name
+                });
+                
+            } catch (error) {
+                console.error('Error sending message:', error);
+                
+                // Clean up files on error
+                if (req.files) {
+                    req.files.forEach(file => {
+                        fs.unlink(file.path, (err) => {
+                            if (err) console.error('Error deleting file on error:', err);
+                        });
+                    });
+                }
+                
+                res.status(500).json({ error: 'Failed to send message' });
+            }
+        });
+
+        // Legacy endpoint for backwards compatibility (using the original route)
+        this.app.post('/api/plugins/message', this.ensureAuthenticated, upload.array('attachments'), async (req, res) => {
+            try {
+                const { serverId, channelId, message, replyToMessageId, stickerId } = req.body;
+                const files = req.files;
+                
+                const hasAdmin = await this.hasAdminPermissions(req.user.id, serverId);
+                if (!hasAdmin) {
+                    return res.status(403).json({ error: 'No admin permissions' });
+                }
+                
+                const channel = this.client.channels.cache.get(channelId);
+                if (!channel) {
+                    return res.status(404).json({ error: 'Channel not found' });
+                }
+                
+                const messageOptions = {};
+                
+                if (message && message.trim()) {
+                    messageOptions.content = message;
+                }
+                
+                if (files && files.length > 0) {
+                    messageOptions.files = files.map(file => ({
+                        attachment: file.path,
+                        name: file.originalname
+                    }));
+                }
+                
+                if (stickerId) {
+                    messageOptions.stickers = [stickerId];
+                }
+                
+                if (replyToMessageId) {
+                    try {
+                        const originalMessage = await channel.messages.fetch(replyToMessageId);
+                        messageOptions.reply = {
+                            messageReference: originalMessage,
+                            failIfNotExists: false
+                        };
+                    } catch (error) {
+                        console.error('Error fetching original message for reply:', error);
+                    }
+                }
+                
+                await channel.send(messageOptions);
+                
                 if (files) {
                     files.forEach(file => {
                         fs.unlink(file.path, (err) => {
@@ -199,16 +271,14 @@ class MessagePlugin {
 
     getFrontendComponent() {
         return {
-            id: 'message-plugin',
+            id: 'message-sender',
             name: 'Message Sender',
             description: 'Send messages to Discord channels with optional attachments, replies, emojis, and stickers',
             icon: '💬',
-            version: '1.0.0',
+            version: '1.1.0',
             containerId: 'messagePluginContainer',
             pageId: 'message-sender',
-            navIcon: '💬',
             
-            // --- CORRECTED HTML STRUCTURE ---
             html: `
                 <div class="plugin-container">
                     <div class="plugin-header">
@@ -216,217 +286,211 @@ class MessagePlugin {
                         <p>Send messages to your Discord channels with optional attachments, replies, emojis, and stickers</p>
                     </div>
                     
-                    <form id="messageForm" enctype="multipart/form-data">
-                        <div class="form-group">
-                            <label for="serverSelect">Server</label>
-                            <select id="serverSelect" required>
-                                <option value="">Select a server...</option>
-                            </select>
+                    <!-- Server Selection with Dashboard Integration -->
+                    <div class="server-sync-notice" style="background: rgba(79, 70, 229, 0.1); border: 1px solid rgba(79, 70, 229, 0.3); border-radius: 8px; padding: 12px; margin-bottom: 20px;">
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <span style="font-size: 18px;">🔗</span>
+                            <div>
+                                <strong>Dashboard Integration</strong>
+                                <div style="font-size: 14px; opacity: 0.8;">Using server: <span id="currentServerName">Auto-detected</span></div>
+                            </div>
                         </div>
-                        
+                    </div>
+                    
+                    <form id="enhancedMessageForm" class="message-form" enctype="multipart/form-data">
                         <div class="form-group">
-                            <label for="channelSelect">Channel</label>
-                            <input type="text" id="messageChannelSearch" class="form-control" placeholder="🔍 Search channels..." style="margin-bottom: 10px; display: none;">
-                            <select id="channelSelect" required disabled>
+                            <label for="messageChannelSelect">Channel</label>
+                            <select id="messageChannelSelect" class="form-control" required>
                                 <option value="">Select a channel...</option>
                             </select>
                         </div>
                         
+                        <!-- Reply Section -->
                         <div class="form-group">
                             <label for="replyMessageId">Reply to Message (Optional)</label>
                             <div style="display: flex; gap: 10px;">
-                                <input type="text" id="replyMessageId" placeholder="Enter message ID to reply to...">
-                                <button type="button" id="fetchMessageBtn" disabled style="padding: 8px 12px; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; color: white; cursor: pointer;">Fetch</button>
+                                <input type="text" id="replyMessageId" class="form-control" placeholder="Enter message ID to reply to...">
+                                <button type="button" id="fetchMessageBtn" class="btn btn-secondary" disabled>
+                                    <span class="btn-text">Fetch</span>
+                                    <span class="btn-loader" style="display: none;">Loading...</span>
+                                </button>
                             </div>
-                            <div id="originalMessagePreview" style="display: none; margin-top: 10px; padding: 10px; background: rgba(255,255,255,0.1); border-radius: 8px; border-left: 4px solid #7289da;">
-                                <div id="originalMessageContent"></div>
+                            <div id="originalMessagePreview" class="message-preview" style="display: none;">
+                                <div class="preview-header">
+                                    <span style="font-size: 12px; opacity: 0.7;">Replying to:</span>
+                                    <button type="button" id="clearReplyBtn" class="clear-btn">×</button>
+                                </div>
+                                <div id="originalMessageContent" class="preview-content"></div>
                             </div>
                         </div>
                         
+                        <!-- Message Content -->
                         <div class="form-group">
-                            <label for="messageText">Message</label>
-                            <textarea id="messageText" placeholder="Type your message here..." rows="4"></textarea>
-                            <div style="display: flex; gap: 10px; margin-top: 10px;">
-                                <button type="button" id="emojiBtn" disabled style="padding: 8px 12px; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; color: white; cursor: pointer;">😀 Emojis</button>
-                                <button type="button" id="stickerBtn" disabled style="padding: 8px 12px; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; color: white; cursor: pointer;">🎭 Stickers</button>
+                            <label for="enhancedMessageText">Message</label>
+                            <textarea id="enhancedMessageText" class="form-control" placeholder="Type your message here..." rows="4"></textarea>
+                            <div class="character-count">
+                                <span id="charCount">0</span>/2000 characters
                             </div>
-                            <div id="emojiPicker" style="display: none; margin-top: 10px; max-height: 300px; overflow-y: auto; background: rgba(255,255,255,0.1); border-radius: 8px; padding: 10px;">
-                                <div id="emojiGrid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(40px, 1fr)); gap: 5px;"></div>
+                        </div>
+                        
+                        <!-- File Attachments -->
+                        <div class="form-group">
+                            <label for="messageAttachments">Attachments (Optional)</label>
+                            <input type="file" id="messageAttachments" class="form-control" multiple accept="image/*,video/*,audio/*,.pdf,.txt,.doc,.docx">
+                            <small style="opacity: 0.7;">Max 25MB per file. Supports images, videos, audio, and documents.</small>
+                            <div id="attachmentPreview" class="attachment-preview"></div>
+                        </div>
+                        
+                        <!-- Quick Actions Row -->
+                        <div class="quick-actions">
+                            <button type="button" id="emojiPickerBtn" class="action-btn">
+                                😀 Add Emoji
+                            </button>
+                            <button type="button" id="stickerPickerBtn" class="action-btn">
+                                🎭 Add Sticker
+                            </button>
+                            <button type="button" id="previewBtn" class="action-btn">
+                                👁️ Preview
+                            </button>
+                        </div>
+                        
+                        <!-- Emoji Picker -->
+                        <div id="emojiPicker" class="picker-container" style="display: none;">
+                            <div class="picker-header">
+                                <h4>Select Emoji</h4>
+                                <button type="button" class="close-picker">×</button>
                             </div>
-                            <div id="stickerPicker" style="display: none; margin-top: 10px; max-height: 300px; overflow-y: auto; background: rgba(255,255,255,0.1); border-radius: 8px; padding: 10px;">
-                                <div id="stickerGrid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(60px, 1fr)); gap: 10px;"></div>
-                                <div id="selectedSticker" style="margin-top: 10px; padding: 10px; background: rgba(255,255,255,0.1); border-radius: 8px; display: none;">
-                                    <strong>Selected Sticker:</strong> <span id="selectedStickerName"></span>
-                                    <button type="button" id="clearStickerBtn" style="margin-left: 10px; padding: 2px 8px; background: rgba(255,0,0,0.3); border: none; border-radius: 4px; color: white; cursor: pointer;">Clear</button>
+                            <div class="picker-tabs">
+                                <button type="button" class="picker-tab active" data-tab="standard">Standard</button>
+                                <button type="button" class="picker-tab" data-tab="custom">Server</button>
+                            </div>
+                            <div class="picker-content">
+                                <div id="standardEmojis" class="emoji-grid">
+                                    <!-- Standard emojis -->
+                                    <span class="emoji-option">😀</span><span class="emoji-option">😃</span><span class="emoji-option">😄</span><span class="emoji-option">😁</span>
+                                    <span class="emoji-option">😅</span><span class="emoji-option">😂</span><span class="emoji-option">🤣</span><span class="emoji-option">😊</span>
+                                    <span class="emoji-option">😇</span><span class="emoji-option">🙂</span><span class="emoji-option">🙃</span><span class="emoji-option">😉</span>
+                                    <span class="emoji-option">😌</span><span class="emoji-option">😍</span><span class="emoji-option">🥰</span><span class="emoji-option">😘</span>
+                                    <span class="emoji-option">👍</span><span class="emoji-option">👎</span><span class="emoji-option">👌</span><span class="emoji-option">✌️</span>
+                                    <span class="emoji-option">🤞</span><span class="emoji-option">🤟</span><span class="emoji-option">🤘</span><span class="emoji-option">🤙</span>
+                                    <span class="emoji-option">❤️</span><span class="emoji-option">🧡</span><span class="emoji-option">💛</span><span class="emoji-option">💚</span>
+                                    <span class="emoji-option">💙</span><span class="emoji-option">💜</span><span class="emoji-option">🖤</span><span class="emoji-option">🤍</span>
+                                    <span class="emoji-option">🔥</span><span class="emoji-option">⭐</span><span class="emoji-option">⚡</span><span class="emoji-option">💯</span>
+                                </div>
+                                <div id="customEmojis" class="emoji-grid" style="display: none;">
+                                    <div class="loading-emojis">Loading server emojis...</div>
                                 </div>
                             </div>
                         </div>
                         
-                        <div class="form-group">
-                            <label for="attachments">Attachments</label>
-                            <input type="file" id="attachments" multiple accept="image/*,video/*,audio/*,.pdf,.txt,.doc,.docx">
-                            <div id="attachmentPreview" class="attachment-preview"></div>
+                        <!-- Sticker Picker -->
+                        <div id="stickerPicker" class="picker-container" style="display: none;">
+                            <div class="picker-header">
+                                <h4>Select Sticker</h4>
+                                <button type="button" class="close-picker">×</button>
+                            </div>
+                            <div id="stickerGrid" class="sticker-grid">
+                                <div class="loading-stickers">Loading server stickers...</div>
+                            </div>
+                            <div id="selectedStickerPreview" class="selected-sticker" style="display: none;">
+                                <span>Selected: <span id="selectedStickerName"></span></span>
+                                <button type="button" id="clearStickerBtn" class="clear-btn">Remove</button>
+                            </div>
                         </div>
                         
-                        <button type="submit" class="btn-primary" disabled>
-                            <span class="btn-text">Send Message</span>
-                            <span class="btn-loader" style="display: none;">Sending...</span>
-                        </button>
+                        <!-- Message Preview -->
+                        <div id="messagePreview" class="message-preview" style="display: none;">
+                            <div class="preview-header">
+                                <span>Message Preview</span>
+                                <button type="button" id="closePreviewBtn" class="clear-btn">×</button>
+                            </div>
+                            <div id="messagePreviewContent" class="preview-content"></div>
+                        </div>
+                        
+                        <!-- Submit Button -->
+                        <div class="form-actions">
+                            <button type="submit" id="enhancedSendBtn" class="btn btn-primary" disabled>
+                                <span class="btn-icon">📤</span>
+                                <span class="btn-text">Send Message</span>
+                                <span class="btn-loader" style="display: none;">Sending...</span>
+                            </button>
+                            <button type="button" id="clearFormBtn" class="btn btn-secondary">
+                                <span class="btn-icon">🗑️</span>
+                                Clear Form
+                            </button>
+                        </div>
                     </form>
+                    
+                    <!-- Success/Error Messages -->
+                    <div id="messageResult" class="result-message" style="display: none;"></div>
                 </div>
             `,
 
-            // --- CORRECTED SCRIPT ---
             script: `
-                // Message Plugin Frontend Logic
+                // Enhanced Message Plugin Frontend Logic with Dashboard Integration
                 (function() {
-                    const serverSelect = document.getElementById('serverSelect');
-                    const channelSelect = document.getElementById('channelSelect');
-                    const messageForm = document.getElementById('messageForm');
-                    const messageText = document.getElementById('messageText');
-                    const attachments = document.getElementById('attachments');
+                    console.log('💬 Enhanced Message Plugin: Initializing...');
+                    
+                    // Get form elements
+                    const messageForm = document.getElementById('enhancedMessageForm');
+                    const channelSelect = document.getElementById('messageChannelSelect');
+                    const messageText = document.getElementById('enhancedMessageText');
+                    const messageAttachments = document.getElementById('messageAttachments');
                     const attachmentPreview = document.getElementById('attachmentPreview');
                     const replyMessageId = document.getElementById('replyMessageId');
                     const fetchMessageBtn = document.getElementById('fetchMessageBtn');
                     const originalMessagePreview = document.getElementById('originalMessagePreview');
                     const originalMessageContent = document.getElementById('originalMessageContent');
-                    const emojiBtn = document.getElementById('emojiBtn');
-                    const stickerBtn = document.getElementById('stickerBtn');
+                    const clearReplyBtn = document.getElementById('clearReplyBtn');
+                    const sendBtn = document.getElementById('enhancedSendBtn');
+                    const clearFormBtn = document.getElementById('clearFormBtn');
+                    const charCount = document.getElementById('charCount');
+                    const currentServerName = document.getElementById('currentServerName');
+                    const messageResult = document.getElementById('messageResult');
+                    
+                    // Picker elements
+                    const emojiPickerBtn = document.getElementById('emojiPickerBtn');
+                    const stickerPickerBtn = document.getElementById('stickerPickerBtn');
+                    const previewBtn = document.getElementById('previewBtn');
                     const emojiPicker = document.getElementById('emojiPicker');
                     const stickerPicker = document.getElementById('stickerPicker');
-                    const emojiGrid = document.getElementById('emojiGrid');
-                    const stickerGrid = document.getElementById('stickerGrid');
-                    const selectedSticker = document.getElementById('selectedSticker');
-                    const selectedStickerName = document.getElementById('selectedStickerName');
-                    const clearStickerBtn = document.getElementById('clearStickerBtn');
-                    const submitBtn = messageForm ? messageForm.querySelector('button[type="submit"]') : null;
-                    const btnText = submitBtn ? submitBtn.querySelector('.btn-text') : null;
-                    const btnLoader = submitBtn ? submitBtn.querySelector('.btn-loader') : null;
+                    const messagePreview = document.getElementById('messagePreview');
                     
-                    let currentReplyMessageId = null;
-                    let currentStickerId = null;
-                    let serverEmojis = [];
-                    let serverStickers = [];
+                    // State variables
+                    let currentServerId = null;
+                    let selectedStickerId = null;
+                    let isFormValid = false;
+                    let serverEmojisLoaded = false;
                     
-                    if (serverSelect) {
-                        loadMessageServers();
-                        serverSelect.addEventListener('change', function() {
-                            const serverId = this.value;
-                            if (serverId) {
-                                loadMessageChannels(serverId);
-                                loadEmojisAndStickers(serverId);
-                                channelSelect.disabled = false;
-                                if (emojiBtn) emojiBtn.disabled = false;
-                                if (stickerBtn) stickerBtn.disabled = false;
-                            } else {
-                                channelSelect.disabled = true;
-                                channelSelect.innerHTML = '<option value="">Select a channel...</option>';
-                                if (emojiBtn) emojiBtn.disabled = true;
-                                if (stickerBtn) stickerBtn.disabled = true;
-                                if (emojiPicker) emojiPicker.style.display = 'none';
-                                if (stickerPicker) stickerPicker.style.display = 'none';
-                            }
-                            updateFetchButton();
-                            updateSubmitButton();
-                        });
-                    }
-                    
-                    if (channelSelect) {
-                        channelSelect.addEventListener('change', function() {
-                            updateFetchButton();
-                            updateSubmitButton();
-                            clearReplyPreview();
-                        });
-                    }
-                    
-                    if (replyMessageId) {
-                        replyMessageId.addEventListener('input', function() {
-                            updateFetchButton();
-                            clearReplyPreview();
-                        });
-                    }
-                    
-                    if (fetchMessageBtn) {
-                        fetchMessageBtn.addEventListener('click', async function() {
-                            await fetchOriginalMessage();
-                        });
-                    }
-                    
-                    if (emojiBtn) {
-                        emojiBtn.addEventListener('click', function() {
-                            if (emojiPicker.style.display === 'none') {
-                                emojiPicker.style.display = 'block';
-                                if (stickerPicker) stickerPicker.style.display = 'none';
-                            } else {
-                                emojiPicker.style.display = 'none';
-                            }
-                        });
-                    }
-                    
-                    if (stickerBtn) {
-                        stickerBtn.addEventListener('click', function() {
-                            if (stickerPicker.style.display === 'none') {
-                                stickerPicker.style.display = 'block';
-                                if (emojiPicker) emojiPicker.style.display = 'none';
-                            } else {
-                                stickerPicker.style.display = 'none';
-                            }
-                        });
-                    }
-                    
-                    if (clearStickerBtn) {
-                        clearStickerBtn.addEventListener('click', function() {
-                            currentStickerId = null;
-                            selectedSticker.style.display = 'none';
-                            updateSubmitButton();
-                        });
-                    }
-                    
-                    if (messageText) {
-                        messageText.addEventListener('input', updateSubmitButton);
-                    }
-                    
-                    if (attachments) {
-                        attachments.addEventListener('change', function() {
-                            updateAttachmentPreview();
-                            updateSubmitButton();
-                        });
-                    }
-                    
-                    if (messageForm) {
-                        messageForm.addEventListener('submit', async function(e) {
-                            e.preventDefault();
-                            await sendMessage();
-                        });
-                    }
-                    
-                    async function loadMessageServers() {
-                        try {
-                            const response = await fetch('/api/servers');
-                            const servers = await response.json();
+                    // Initialize plugin
+                    function initializeMessagePlugin() {
+                        console.log('💬 Initializing enhanced message plugin...');
+                        
+                        // Get current server from dashboard
+                        if (window.dashboardAPI && window.dashboardAPI.currentServer) {
+                            currentServerId = window.dashboardAPI.currentServer();
+                            console.log('💬 Current server from dashboard:', currentServerId);
                             
-                            serverSelect.innerHTML = '<option value="">Select a server...</option>';
-                            servers.forEach(server => {
-                                const option = document.createElement('option');
-                                option.value = server.id;
-                                option.textContent = server.name;
-                                serverSelect.appendChild(option);
-                            });
-                        } catch (error) {
-                            console.error('Error loading servers:', error);
-                            if (window.showNotification) {
-                                window.showNotification('Error loading servers', 'error');
+                            if (currentServerId) {
+                                loadChannelsForServer(currentServerId);
+                                updateServerDisplay();
                             }
                         }
+                        
+                        setupEventListeners();
+                        updateFormValidation();
+                        
+                        console.log('✅ Enhanced message plugin initialized');
                     }
                     
-                    async function loadMessageChannels(serverId) {
-                        const searchInput = document.getElementById('messageChannelSearch');
+                    // Load channels for the current server
+                    async function loadChannelsForServer(serverId) {
+                        if (!serverId || !channelSelect) return;
+                        
                         try {
-                            channelSelect.innerHTML = '<option value="">Loading...</option>';
-                            if (searchInput) searchInput.style.display = 'none';
-
                             const response = await fetch(\`/api/channels/\${serverId}\`);
+                            if (!response.ok) throw new Error('Failed to load channels');
+                            
                             const channels = await response.json();
                             
                             channelSelect.innerHTML = '<option value="">Select a channel...</option>';
@@ -436,148 +500,249 @@ class MessagePlugin {
                                 option.textContent = \`# \${channel.name}\`;
                                 channelSelect.appendChild(option);
                             });
-
-                            if (searchInput) searchInput.style.display = 'block';
-                            window.setupChannelSearch('messageChannelSearch', 'channelSelect');
-
+                            
+                            console.log(\`💬 Loaded \${channels.length} channels for server\`);
                         } catch (error) {
                             console.error('Error loading channels:', error);
-                            channelSelect.innerHTML = '<option value="">Error loading channels</option>';
-                            if (searchInput) searchInput.style.display = 'none';
-                        }
-                    }
-                    
-                    async function loadEmojisAndStickers(serverId) {
-                        try {
-                            const response = await fetch(\`/api/plugins/message/emojis/\${serverId}\`);
-                            const data = await response.json();
-                            
-                            if (response.ok) {
-                                serverEmojis = data.emojis;
-                                serverStickers = data.stickers;
-                                displayEmojis();
-                                displayStickers();
-                            } else {
-                                console.error('Error loading emojis and stickers:', data.error);
+                            if (window.dashboardAPI && window.dashboardAPI.showNotification) {
+                                window.dashboardAPI.showNotification('Failed to load channels', 'error');
                             }
-                        } catch (error) {
-                            console.error('Error loading emojis and stickers:', error);
                         }
                     }
                     
-                    function displayEmojis() {
-                        if (!emojiGrid) return;
+                    // Update server display
+                    function updateServerDisplay() {
+                        if (currentServerName && window.dashboardAPI && window.dashboardAPI.getServerName) {
+                            const serverName = window.dashboardAPI.getServerName(currentServerId);
+                            currentServerName.textContent = serverName || 'Unknown Server';
+                        }
+                    }
+                    
+                    // Setup all event listeners
+                    function setupEventListeners() {
+                        // Form validation
+                        if (messageText) {
+                            messageText.addEventListener('input', function() {
+                                updateCharacterCount();
+                                updateFormValidation();
+                            });
+                        }
                         
-                        emojiGrid.innerHTML = '';
-                        serverEmojis.forEach(emoji => {
-                            const emojiElement = document.createElement('div');
-                            emojiElement.style.cssText = 'cursor: pointer; padding: 5px; border-radius: 4px; text-align: center; transition: background 0.2s;';
-                            emojiElement.innerHTML = \`<img src="\${emoji.url}" alt="\${emoji.name}" title="\${emoji.name}" style="width: 32px; height: 32px;">\`;
-                            
-                            emojiElement.addEventListener('click', function() {
-                                insertEmoji(emoji.usage);
+                        if (channelSelect) {
+                            channelSelect.addEventListener('change', updateFormValidation);
+                        }
+                        
+                        if (messageAttachments) {
+                            messageAttachments.addEventListener('change', function() {
+                                updateAttachmentPreview();
+                                updateFormValidation();
                             });
-                            
-                            emojiElement.addEventListener('mouseenter', function() {
-                                this.style.background = 'rgba(255,255,255,0.1)';
+                        }
+                        
+                        if (replyMessageId) {
+                            replyMessageId.addEventListener('input', function() {
+                                updateFetchButtonState();
                             });
+                        }
+                        
+                        // Fetch message for reply
+                        if (fetchMessageBtn) {
+                            fetchMessageBtn.addEventListener('click', fetchOriginalMessage);
+                        }
+                        
+                        // Clear reply
+                        if (clearReplyBtn) {
+                            clearReplyBtn.addEventListener('click', clearReply);
+                        }
+                        
+                        // Form submission
+                        if (messageForm) {
+                            messageForm.addEventListener('submit', handleFormSubmit);
+                        }
+                        
+                        // Clear form
+                        if (clearFormBtn) {
+                            clearFormBtn.addEventListener('click', clearForm);
+                        }
+                        
+                        // Picker buttons
+                        if (emojiPickerBtn) {
+                            emojiPickerBtn.addEventListener('click', toggleEmojiPicker);
+                        }
+                        
+                        if (stickerPickerBtn) {
+                            stickerPickerBtn.addEventListener('click', toggleStickerPicker);
+                        }
+                        
+                        if (previewBtn) {
+                            previewBtn.addEventListener('click', toggleMessagePreview);
+                        }
+                        
+                        // Emoji and sticker selection
+                        document.addEventListener('click', function(e) {
+                            if (e.target.classList.contains('emoji-option')) {
+                                insertEmoji(e.target.textContent);
+                            }
                             
-                            emojiElement.addEventListener('mouseleave', function() {
-                                this.style.background = 'transparent';
-                            });
+                            if (e.target.classList.contains('close-picker')) {
+                                closePickers();
+                            }
                             
-                            emojiGrid.appendChild(emojiElement);
+                            if (e.target.classList.contains('picker-tab')) {
+                                switchEmojiTab(e.target.dataset.tab);
+                            }
                         });
+                        
+                        console.log('💬 Event listeners setup complete');
                     }
                     
-                    function displayStickers() {
-                        if (!stickerGrid) return;
+                    // Update character count
+                    function updateCharacterCount() {
+                        if (!messageText || !charCount) return;
                         
-                        stickerGrid.innerHTML = '';
-                        serverStickers.forEach(sticker => {
-                            const stickerElement = document.createElement('div');
-                            stickerElement.style.cssText = 'cursor: pointer; padding: 5px; border-radius: 4px; text-align: center; transition: background 0.2s;';
-                            stickerElement.innerHTML = \`<img src="\${sticker.url}" alt="\${sticker.name}" title="\${sticker.name}" style="width: 50px; height: 50px; object-fit: contain;">\`;
-                            
-                            stickerElement.addEventListener('click', function() {
-                                selectSticker(sticker);
+                        const count = messageText.value.length;
+                        charCount.textContent = count;
+                        
+                        if (count > 2000) {
+                            charCount.style.color = '#ef4444';
+                        } else if (count > 1800) {
+                            charCount.style.color = '#f59e0b';
+                        } else {
+                            charCount.style.color = '#9ca3af';
+                        }
+                    }
+                    
+                    // Update attachment preview
+                    function updateAttachmentPreview() {
+                        if (!attachmentPreview || !messageAttachments) return;
+                        
+                        const files = Array.from(messageAttachments.files);
+                        attachmentPreview.innerHTML = '';
+                        
+                        if (files.length > 0) {
+                            attachmentPreview.style.display = 'block';
+                            files.forEach((file, index) => {
+                                const fileDiv = document.createElement('div');
+                                fileDiv.className = 'attachment-item';
+                                fileDiv.innerHTML = \`
+                                    <div class="attachment-info">
+                                        <span class="attachment-name">\${file.name}</span>
+                                        <span class="attachment-size">(\${formatFileSize(file.size)})</span>
+                                    </div>
+                                    <button type="button" class="remove-attachment" data-index="\${index}">×</button>
+                                \`;
+                                attachmentPreview.appendChild(fileDiv);
                             });
                             
-                            stickerElement.addEventListener('mouseenter', function() {
-                                this.style.background = 'rgba(255,255,255,0.1)';
+                            // Add remove buttons
+                            attachmentPreview.addEventListener('click', function(e) {
+                                if (e.target.classList.contains('remove-attachment')) {
+                                    const index = parseInt(e.target.dataset.index);
+                                    removeAttachment(index);
+                                }
                             });
-                            
-                            stickerElement.addEventListener('mouseleave', function() {
-                                this.style.background = 'transparent';
-                            });
-                            
-                            stickerGrid.appendChild(stickerElement);
+                        } else {
+                            attachmentPreview.style.display = 'none';
+                        }
+                    }
+                    
+                    // Remove attachment
+                    function removeAttachment(index) {
+                        if (!messageAttachments) return;
+                        
+                        const dt = new DataTransfer();
+                        const files = Array.from(messageAttachments.files);
+                        
+                        files.forEach((file, i) => {
+                            if (i !== index) {
+                                dt.items.add(file);
+                            }
                         });
-                    }
-                    
-                    function insertEmoji(emojiUsage) {
-                        if (!messageText) return;
                         
-                        const currentText = messageText.value;
-                        const cursorPos = messageText.selectionStart;
-                        const newText = currentText.slice(0, cursorPos) + emojiUsage + ' ' + currentText.slice(cursorPos);
+                        messageAttachments.files = dt.files;
+                        updateAttachmentPreview();
+                        updateFormValidation();
+                    }
+                    
+                    // Format file size
+                    function formatFileSize(bytes) {
+                        if (bytes === 0) return '0 Bytes';
+                        const k = 1024;
+                        const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+                        const i = Math.floor(Math.log(bytes) / Math.log(k));
+                        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+                    }
+                    
+                    // Update form validation
+                    function updateFormValidation() {
+                        const hasChannel = channelSelect && channelSelect.value;
+                        const hasMessage = messageText && messageText.value.trim();
+                        const hasAttachments = messageAttachments && messageAttachments.files.length > 0;
+                        const hasSticker = selectedStickerId;
+                        const validLength = messageText && messageText.value.length <= 2000;
                         
-                        messageText.value = newText;
-                        messageText.focus();
-                        messageText.setSelectionRange(cursorPos + emojiUsage.length + 1, cursorPos + emojiUsage.length + 1);
-                        updateSubmitButton();
+                        isFormValid = hasChannel && (hasMessage || hasAttachments || hasSticker) && validLength;
+                        
+                        if (sendBtn) {
+                            sendBtn.disabled = !isFormValid;
+                        }
+                        
+                        updateFetchButtonState();
                     }
                     
-                    function selectSticker(sticker) {
-                        currentStickerId = sticker.id;
-                        if (selectedStickerName) selectedStickerName.textContent = sticker.name;
-                        if (selectedSticker) selectedSticker.style.display = 'block';
-                        if (stickerPicker) stickerPicker.style.display = 'none';
-                        updateSubmitButton();
+                    // Update fetch button state
+                    function updateFetchButtonState() {
+                        if (!fetchMessageBtn) return;
+                        
+                        const hasChannel = channelSelect && channelSelect.value;
+                        const hasMessageId = replyMessageId && replyMessageId.value.trim();
+                        
+                        fetchMessageBtn.disabled = !hasChannel || !hasMessageId;
                     }
                     
+                    // Fetch original message for reply
                     async function fetchOriginalMessage() {
-                        const channelId = channelSelect ? channelSelect.value : '';
-                        const messageId = replyMessageId ? replyMessageId.value.trim() : '';
+                        if (!channelSelect.value || !replyMessageId.value.trim()) return;
                         
-                        if (!channelId || !messageId) return;
+                        const btnText = fetchMessageBtn.querySelector('.btn-text');
+                        const btnLoader = fetchMessageBtn.querySelector('.btn-loader');
+                        
+                        // Show loading state
+                        if (btnText) btnText.style.display = 'none';
+                        if (btnLoader) btnLoader.style.display = 'inline';
+                        fetchMessageBtn.disabled = true;
                         
                         try {
-                            if (fetchMessageBtn) {
-                                fetchMessageBtn.textContent = 'Fetching...';
-                                fetchMessageBtn.disabled = true;
+                            const response = await fetch(\`/api/plugins/message/fetch/\${channelSelect.value}/\${replyMessageId.value.trim()}\`);
+                            
+                            if (!response.ok) {
+                                throw new Error('Message not found');
                             }
                             
-                            const response = await fetch(\`/api/plugins/message/\${channelId}/\${messageId}\`);
                             const messageData = await response.json();
+                            displayOriginalMessage(messageData);
                             
-                            if (response.ok) {
-                                currentReplyMessageId = messageId;
-                                displayOriginalMessage(messageData);
-                                updateSubmitButton();
-                            } else {
-                                throw new Error(messageData.error || 'Failed to fetch message');
-                            }
                         } catch (error) {
                             console.error('Error fetching message:', error);
-                            if (window.showNotification) {
-                                window.showNotification(error.message, 'error');
+                            if (window.dashboardAPI && window.dashboardAPI.showNotification) {
+                                window.dashboardAPI.showNotification('Message not found', 'error');
                             }
-                            clearReplyPreview();
                         } finally {
-                            if (fetchMessageBtn) {
-                                fetchMessageBtn.textContent = 'Fetch';
-                                updateFetchButton();
-                            }
+                            // Reset button state
+                            if (btnText) btnText.style.display = 'inline';
+                            if (btnLoader) btnLoader.style.display = 'none';
+                            updateFetchButtonState();
                         }
                     }
                     
+                    // Display original message preview
                     function displayOriginalMessage(messageData) {
-                        if (!originalMessageContent) return;
+                        if (!originalMessageContent || !originalMessagePreview) return;
                         
                         const createdAt = new Date(messageData.createdAt).toLocaleString();
+                        
                         originalMessageContent.innerHTML = \`
-                            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+                            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
                                 <img src="\${messageData.author.avatar}" alt="Avatar" style="width: 20px; height: 20px; border-radius: 50%;">
                                 <strong>\${messageData.author.username}</strong>
                                 <span style="opacity: 0.7; font-size: 0.9em;">\${createdAt}</span>
@@ -585,85 +750,276 @@ class MessagePlugin {
                             <div style="margin-left: 28px;">
                                 \${messageData.content || '<em>No text content</em>'}
                             </div>
+                            \${messageData.attachments.length > 0 ? '<div style="margin-left: 28px; margin-top: 4px; opacity: 0.7; font-size: 0.9em;">📎 ' + messageData.attachments.length + ' attachment(s)</div>' : ''}
                             <div style="margin-left: 28px; margin-top: 4px; opacity: 0.7; font-size: 0.9em;">
                                 in #\${messageData.channelName} • \${messageData.guildName}
                             </div>
                         \`;
-                        if (originalMessagePreview) originalMessagePreview.style.display = 'block';
+                        
+                        originalMessagePreview.style.display = 'block';
                     }
                     
-                    function clearReplyPreview() {
-                        currentReplyMessageId = null;
+                    // Clear reply
+                    function clearReply() {
+                        if (replyMessageId) replyMessageId.value = '';
                         if (originalMessagePreview) originalMessagePreview.style.display = 'none';
-                        updateSubmitButton();
+                        updateFormValidation();
                     }
                     
-                    function updateFetchButton() {
-                        if (!fetchMessageBtn) return;
-                        
-                        const hasChannel = channelSelect ? channelSelect.value : false;
-                        const hasMessageId = replyMessageId ? replyMessageId.value.trim() : false;
-                        fetchMessageBtn.disabled = !hasChannel || !hasMessageId;
-                    }
-                    
-                    function updateAttachmentPreview() {
-                        if (!attachmentPreview || !attachments) return;
-                        
-                        const files = Array.from(attachments.files);
-                        attachmentPreview.innerHTML = '';
-                        
-                        if (files.length > 0) {
-                            files.forEach((file, index) => {
-                                const fileDiv = document.createElement('div');
-                                fileDiv.className = 'attachment-item';
-                                fileDiv.innerHTML = \`
-                                    <span class="attachment-name">\${file.name}</span>
-                                    <span class="attachment-size">(\${formatFileSize(file.size)})</span>
-                                \`;
-                                attachmentPreview.appendChild(fileDiv);
-                            });
+                    // Toggle emoji picker
+                    function toggleEmojiPicker() {
+                        closePickers();
+                        if (emojiPicker) {
+                            emojiPicker.style.display = emojiPicker.style.display === 'none' ? 'block' : 'none';
+                            
+                            // Load server emojis if not loaded
+                            if (emojiPicker.style.display === 'block' && !serverEmojisLoaded && currentServerId) {
+                                loadServerEmojis();
+                            }
                         }
                     }
                     
-                    function updateSubmitButton() {
-                        if (!submitBtn) return;
+                    // Switch emoji tab
+                    function switchEmojiTab(tab) {
+                        // Update tab buttons
+                        document.querySelectorAll('.picker-tab').forEach(btn => {
+                            btn.classList.remove('active');
+                        });
+                        document.querySelector(\`[data-tab="\${tab}"]\`)?.classList.add('active');
                         
-                        const hasServer = serverSelect ? serverSelect.value : false;
-                        const hasChannel = channelSelect ? channelSelect.value : false;
-                        const hasMessage = messageText ? messageText.value.trim() : false;
-                        const hasAttachments = attachments ? attachments.files.length > 0 : false;
-                        const hasSticker = currentStickerId;
-                        
-                        const canSubmit = hasServer && hasChannel && (hasMessage || hasAttachments || hasSticker);
-                        submitBtn.disabled = !canSubmit;
+                        // Show/hide content
+                        if (tab === 'standard') {
+                            document.getElementById('standardEmojis').style.display = 'grid';
+                            document.getElementById('customEmojis').style.display = 'none';
+                        } else {
+                            document.getElementById('standardEmojis').style.display = 'none';
+                            document.getElementById('customEmojis').style.display = 'grid';
+                            
+                            if (!serverEmojisLoaded && currentServerId) {
+                                loadServerEmojis();
+                            }
+                        }
                     }
                     
-                    async function sendMessage() {
-                        if (!serverSelect || !channelSelect) return;
-                        
-                        const formData = new FormData();
-                        formData.append('serverId', serverSelect.value);
-                        formData.append('channelId', channelSelect.value);
-                        formData.append('message', messageText ? messageText.value : '');
-                        
-                        if (currentReplyMessageId) {
-                            formData.append('replyToMessageId', currentReplyMessageId);
-                        }
-                        
-                        if (currentStickerId) {
-                            formData.append('stickerId', currentStickerId);
-                        }
-                        
-                        if (attachments) {
-                            Array.from(attachments.files).forEach(file => {
-                                formData.append('attachments', file);
-                            });
-                        }
+                    // Load server emojis
+                    async function loadServerEmojis() {
+                        const customEmojis = document.getElementById('customEmojis');
+                        if (!customEmojis || !currentServerId) return;
                         
                         try {
-                            if (btnText) btnText.style.display = 'none';
-                            if (btnLoader) btnLoader.style.display = 'inline';
-                            if (submitBtn) submitBtn.disabled = true;
+                            customEmojis.innerHTML = '<div class="loading-emojis">Loading server emojis...</div>';
+                            
+                            const response = await fetch(\`/api/plugins/message/emojis/\${currentServerId}\`);
+                            if (!response.ok) throw new Error('Failed to load emojis');
+                            
+                            const data = await response.json();
+                            const emojis = data.emojis || [];
+                            
+                            if (emojis.length === 0) {
+                                customEmojis.innerHTML = '<div class="no-emojis">No custom emojis available in this server</div>';
+                                return;
+                            }
+                            
+                            customEmojis.innerHTML = '';
+                            emojis.forEach(emoji => {
+                                const emojiSpan = document.createElement('span');
+                                emojiSpan.className = 'emoji-option custom-emoji';
+                                emojiSpan.innerHTML = \`<img src="\${emoji.url}" alt="\${emoji.name}" title="\${emoji.name}" style="width: 24px; height: 24px;">\`;
+                                emojiSpan.dataset.emojiUsage = emoji.usage;
+                                
+                                emojiSpan.addEventListener('click', () => {
+                                    insertEmoji(emoji.usage);
+                                });
+                                
+                                customEmojis.appendChild(emojiSpan);
+                            });
+                            
+                            serverEmojisLoaded = true;
+                            
+                        } catch (error) {
+                            console.error('Error loading server emojis:', error);
+                            customEmojis.innerHTML = '<div class="error-emojis">Failed to load server emojis</div>';
+                        }
+                    }
+                    
+                    // Toggle sticker picker
+                    async function toggleStickerPicker() {
+                        closePickers();
+                        
+                        if (stickerPicker) {
+                            stickerPicker.style.display = stickerPicker.style.display === 'none' ? 'block' : 'none';
+                            
+                            if (stickerPicker.style.display === 'block' && currentServerId) {
+                                await loadServerStickers();
+                            }
+                        }
+                    }
+                    
+                    // Load server stickers
+                    async function loadServerStickers() {
+                        const stickerGrid = document.getElementById('stickerGrid');
+                        if (!stickerGrid || !currentServerId) return;
+                        
+                        try {
+                            stickerGrid.innerHTML = '<div class="loading-stickers">Loading server stickers...</div>';
+                            
+                            const response = await fetch(\`/api/plugins/message/emojis/\${currentServerId}\`);
+                            if (!response.ok) throw new Error('Failed to load stickers');
+                            
+                            const data = await response.json();
+                            const stickers = data.stickers || [];
+                            
+                            if (stickers.length === 0) {
+                                stickerGrid.innerHTML = '<div class="no-stickers">No custom stickers available in this server</div>';
+                                return;
+                            }
+                            
+                            stickerGrid.innerHTML = '';
+                            stickers.forEach(sticker => {
+                                const stickerDiv = document.createElement('div');
+                                stickerDiv.className = 'sticker-option';
+                                stickerDiv.dataset.stickerId = sticker.id;
+                                stickerDiv.innerHTML = \`
+                                    <img src="\${sticker.url}" alt="\${sticker.name}" style="width: 60px; height: 60px; border-radius: 8px;">
+                                    <div style="font-size: 12px; margin-top: 4px;">\${sticker.name}</div>
+                                \`;
+                                
+                                stickerDiv.addEventListener('click', () => selectSticker(sticker));
+                                stickerGrid.appendChild(stickerDiv);
+                            });
+                            
+                        } catch (error) {
+                            console.error('Error loading stickers:', error);
+                            stickerGrid.innerHTML = '<div class="error-stickers">Failed to load stickers</div>';
+                        }
+                    }
+                    
+                    // Select sticker
+                    function selectSticker(sticker) {
+                        selectedStickerId = sticker.id;
+                        
+                        const preview = document.getElementById('selectedStickerPreview');
+                        const name = document.getElementById('selectedStickerName');
+                        
+                        if (preview && name) {
+                            name.textContent = sticker.name;
+                            preview.style.display = 'block';
+                        }
+                        
+                        updateFormValidation();
+                        closePickers();
+                    }
+                    
+                    // Clear sticker selection
+                    if (document.getElementById('clearStickerBtn')) {
+                        document.getElementById('clearStickerBtn').addEventListener('click', function() {
+                            selectedStickerId = null;
+                            const preview = document.getElementById('selectedStickerPreview');
+                            if (preview) preview.style.display = 'none';
+                            updateFormValidation();
+                        });
+                    }
+                    
+                    // Toggle message preview
+                    function toggleMessagePreview() {
+                        const preview = document.getElementById('messagePreview');
+                        const content = document.getElementById('messagePreviewContent');
+                        
+                        if (!preview || !content) return;
+                        
+                        if (preview.style.display === 'none' || !preview.style.display) {
+                            const messageContent = messageText.value.trim() || '<em>No message text</em>';
+                            const attachmentCount = messageAttachments ? messageAttachments.files.length : 0;
+                            
+                            content.innerHTML = \`
+                                <div style="padding: 12px; background: rgba(255,255,255,0.05); border-radius: 8px;">
+                                    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+                                        <div style="width: 32px; height: 32px; background: #7289da; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold;">
+                                            \${window.dashboardAPI && window.dashboardAPI.currentUser ? window.dashboardAPI.currentUser().username.charAt(0).toUpperCase() : 'U'}
+                                        </div>
+                                        <strong>\${window.dashboardAPI && window.dashboardAPI.currentUser ? window.dashboardAPI.currentUser().username : 'You'}</strong>
+                                        <span style="opacity: 0.7; font-size: 0.9em;">now</span>
+                                    </div>
+                                    <div style="margin-left: 40px;">
+                                        \${messageContent.replace(/\\n/g, '<br>')}
+                                    </div>
+                                    \${attachmentCount > 0 ? '<div style="margin-left: 40px; margin-top: 8px; opacity: 0.7; font-size: 0.9em;">📎 ' + attachmentCount + ' attachment(s)</div>' : ''}
+                                    \${selectedStickerId ? '<div style="margin-left: 40px; margin-top: 8px; opacity: 0.7; font-size: 0.9em;">🎭 Selected sticker</div>' : ''}
+                                </div>
+                            \`;
+                            preview.style.display = 'block';
+                        } else {
+                            preview.style.display = 'none';
+                        }
+                    }
+                    
+                    // Insert emoji at cursor position
+                    function insertEmoji(emoji) {
+                        if (!messageText) return;
+                        
+                        const cursorPos = messageText.selectionStart;
+                        const textBefore = messageText.value.substring(0, cursorPos);
+                        const textAfter = messageText.value.substring(messageText.selectionEnd);
+                        
+                        messageText.value = textBefore + emoji + textAfter;
+                        messageText.focus();
+                        messageText.setSelectionRange(cursorPos + emoji.length, cursorPos + emoji.length);
+                        
+                        updateCharacterCount();
+                        updateFormValidation();
+                        closePickers();
+                    }
+                    
+                    // Close all pickers
+                    function closePickers() {
+                        if (emojiPicker) emojiPicker.style.display = 'none';
+                        if (stickerPicker) stickerPicker.style.display = 'none';
+                        if (messagePreview) messagePreview.style.display = 'none';
+                    }
+                    
+                    // Handle form submission
+                    async function handleFormSubmit(e) {
+                        e.preventDefault();
+                        
+                        if (!isFormValid || !currentServerId) {
+                            if (window.dashboardAPI && window.dashboardAPI.showNotification) {
+                                window.dashboardAPI.showNotification('Please fill in all required fields', 'error');
+                            }
+                            return;
+                        }
+                        
+                        // Show loading state
+                        const btnText = sendBtn.querySelector('.btn-text');
+                        const btnLoader = sendBtn.querySelector('.btn-loader');
+                        
+                        if (btnText) btnText.style.display = 'none';
+                        if (btnLoader) btnLoader.style.display = 'inline';
+                        sendBtn.disabled = true;
+                        
+                        try {
+                            // Prepare form data
+                            const formData = new FormData();
+                            formData.append('serverId', currentServerId);
+                            formData.append('channelId', channelSelect.value);
+                            
+                            if (messageText.value.trim()) {
+                                formData.append('message', messageText.value.trim());
+                            }
+                            
+                            if (replyMessageId.value.trim()) {
+                                formData.append('replyToMessageId', replyMessageId.value.trim());
+                            }
+                            
+                            if (selectedStickerId) {
+                                formData.append('stickerId', selectedStickerId);
+                            }
+                            
+                            // Add attachments
+                            if (messageAttachments && messageAttachments.files.length > 0) {
+                                Array.from(messageAttachments.files).forEach(file => {
+                                    formData.append('attachments', file);
+                                });
+                            }
                             
                             const response = await fetch('/api/plugins/message/send', {
                                 method: 'POST',
@@ -673,51 +1029,109 @@ class MessagePlugin {
                             const result = await response.json();
                             
                             if (response.ok) {
-                                let messageType = 'Message sent successfully!';
-                                if (currentReplyMessageId && currentStickerId) {
-                                    messageType = 'Reply with sticker sent successfully!';
-                                } else if (currentReplyMessageId) {
-                                    messageType = 'Reply sent successfully!';
-                                } else if (currentStickerId) {
-                                    messageType = 'Sticker sent successfully!';
+                                // Success
+                                showResult('Message sent successfully!', 'success');
+                                
+                                if (window.dashboardAPI) {
+                                    if (window.dashboardAPI.showNotification) {
+                                        window.dashboardAPI.showNotification(\`Message sent to #\${result.channelName}\`, 'success');
+                                    }
+                                    if (window.dashboardAPI.addLogEntry) {
+                                        window.dashboardAPI.addLogEntry('success', \`Message sent to #\${result.channelName}\`);
+                                    }
                                 }
                                 
-                                if (window.showNotification) {
-                                    window.showNotification(messageType, 'success');
-                                }
-                                
-                                // Clear form
-                                if (messageText) messageText.value = '';
-                                if (attachments) attachments.value = '';
-                                if (replyMessageId) replyMessageId.value = '';
-                                currentStickerId = null;
-                                if (selectedSticker) selectedSticker.style.display = 'none';
-                                updateAttachmentPreview();
-                                clearReplyPreview();
-                                updateSubmitButton();
-                                updateFetchButton();
+                                clearForm();
                             } else {
+                                // Error
                                 throw new Error(result.error || 'Failed to send message');
                             }
+                            
                         } catch (error) {
                             console.error('Error sending message:', error);
-                            if (window.showNotification) {
-                                window.showNotification(error.message, 'error');
+                            showResult(\`Error: \${error.message}\`, 'error');
+                            
+                            if (window.dashboardAPI && window.dashboardAPI.showNotification) {
+                                window.dashboardAPI.showNotification(error.message, 'error');
                             }
                         } finally {
+                            // Reset button state
                             if (btnText) btnText.style.display = 'inline';
                             if (btnLoader) btnLoader.style.display = 'none';
-                            updateSubmitButton();
+                            updateFormValidation();
                         }
                     }
                     
-                    function formatFileSize(bytes) {
-                        if (bytes === 0) return '0 Bytes';
-                        const k = 1024;
-                        const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-                        const i = Math.floor(Math.log(bytes) / Math.log(k));
-                        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+                    // Show result message
+                    function showResult(message, type) {
+                        if (!messageResult) return;
+                        
+                        messageResult.textContent = message;
+                        messageResult.className = \`result-message \${type}\`;
+                        messageResult.style.display = 'block';
+                        
+                        // Hide after 5 seconds
+                        setTimeout(() => {
+                            messageResult.style.display = 'none';
+                        }, 5000);
                     }
+                    
+                    // Clear form
+                    function clearForm() {
+                        if (messageText) messageText.value = '';
+                        if (messageAttachments) messageAttachments.value = '';
+                        if (attachmentPreview) attachmentPreview.style.display = 'none';
+                        if (replyMessageId) replyMessageId.value = '';
+                        if (originalMessagePreview) originalMessagePreview.style.display = 'none';
+                        if (messagePreview) messagePreview.style.display = 'none';
+                        
+                        selectedStickerId = null;
+                        const stickerPreview = document.getElementById('selectedStickerPreview');
+                        if (stickerPreview) stickerPreview.style.display = 'none';
+                        
+                        updateCharacterCount();
+                        updateFormValidation();
+                        closePickers();
+                        
+                        if (window.dashboardAPI && window.dashboardAPI.addLogEntry) {
+                            window.dashboardAPI.addLogEntry('info', 'Message form cleared');
+                        }
+                    }
+                    
+                    // Listen for dashboard server changes
+                    if (window.dashboardAPI) {
+                        // Store original function if it exists
+                        const originalHandleServerChange = window.dashboardAPI.handleServerChange;
+                        
+                        // Override with our enhanced version
+                        window.dashboardAPI.handleServerChange = function(serverId) {
+                            // Call original function
+                            if (originalHandleServerChange) {
+                                originalHandleServerChange.call(this, serverId);
+                            }
+                            
+                            // Update our plugin
+                            currentServerId = serverId;
+                            console.log('💬 Message plugin: Server changed to', serverId);
+                            
+                            if (serverId) {
+                                loadChannelsForServer(serverId);
+                                updateServerDisplay();
+                                clearForm(); // Clear form when server changes
+                                serverEmojisLoaded = false; // Reset emoji cache
+                            }
+                        };
+                    }
+                    
+                    // Initialize when page loads
+                    if (document.readyState === 'loading') {
+                        document.addEventListener('DOMContentLoaded', initializeMessagePlugin);
+                    } else {
+                        initializeMessagePlugin();
+                    }
+                    
+                    console.log('✅ Enhanced Message Plugin loaded successfully');
+                    
                 })();
             `
         };
@@ -725,4 +1139,3 @@ class MessagePlugin {
 }
 
 module.exports = MessagePlugin;
-                                
