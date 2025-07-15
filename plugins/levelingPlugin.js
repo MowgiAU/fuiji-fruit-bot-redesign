@@ -16,6 +16,10 @@ class LevelingPlugin {
         this.dataPath = path.join(__dirname, '../data/levelingData.json');
         this.settingsPath = path.join(__dirname, '../data/levelingSettings.json');
         
+        // Cooldowns to prevent XP spam
+        this.messageCooldowns = new Map();
+        this.voiceTracker = new Map();
+        
         this.initializeData();
         this.setupRoutes();
         this.setupEventListeners();
@@ -24,24 +28,28 @@ class LevelingPlugin {
 
     async initializeData() {
         try {
+            // Initialize leveling data file
             try {
                 await fs.access(this.dataPath);
             } catch {
                 await fs.writeFile(this.dataPath, JSON.stringify({ users: {} }, null, 2));
             }
 
+            // Initialize settings file
             try {
                 await fs.access(this.settingsPath);
             } catch {
                 await fs.writeFile(this.settingsPath, JSON.stringify({}, null, 2));
             }
+
+            console.log('✅ Leveling system data initialized');
         } catch (error) {
             console.error('Error initializing leveling data:', error);
         }
     }
 
     setupRoutes() {
-        // Get leveling statistics
+        // Get leveling statistics for dashboard
         this.app.get('/api/plugins/leveling/stats/:guildId', this.ensureAuthenticated, async (req, res) => {
             try {
                 const { guildId } = req.params;
@@ -53,40 +61,96 @@ class LevelingPlugin {
                 const data = await this.loadData();
                 const settings = await this.loadSettings();
                 
+                // Calculate server statistics
                 const serverUsers = Object.keys(data.users).filter(userId => 
                     data.users[userId][guildId]
                 ).length;
-                
-                let totalXP = 0;
-                let totalVoiceTime = 0;
-                let totalReactions = 0;
-                let maxLevel = 0;
-                
-                Object.keys(data.users).forEach(userId => {
-                    const userData = data.users[userId][guildId];
-                    if (userData) {
-                        totalXP += userData.xp || 0;
-                        totalVoiceTime += userData.voiceTime || 0;
-                        totalReactions += (userData.reactionsGiven || 0) + (userData.reactionsReceived || 0);
-                        maxLevel = Math.max(maxLevel, userData.level || 0);
-                    }
-                });
+
+                const totalXP = Object.keys(data.users).reduce((total, userId) => {
+                    const userGuildData = data.users[userId][guildId];
+                    return total + (userGuildData?.xp || 0);
+                }, 0);
+
+                const averageLevel = serverUsers > 0 ? Math.floor(
+                    Object.keys(data.users).reduce((total, userId) => {
+                        const userGuildData = data.users[userId][guildId];
+                        return total + (userGuildData?.level || 0);
+                    }, 0) / serverUsers
+                ) : 0;
+
+                const guildSettings = settings[guildId] || {};
+                const isEnabled = this.isLevelingEnabled(guildId, settings);
 
                 res.json({
-                    serverUsers,
-                    totalXP,
-                    totalVoiceTime,
-                    totalReactions,
-                    maxLevel,
-                    isEnabled: this.isLevelingEnabled(guildId, settings)
+                    activeUsers: serverUsers,
+                    totalXp: totalXP,
+                    averageLevel: averageLevel,
+                    enabled: isEnabled,
+                    xpSources: guildSettings.xpSources || {},
+                    settings: guildSettings
                 });
             } catch (error) {
-                console.error('Error fetching leveling stats:', error);
-                res.status(500).json({ error: 'Failed to fetch leveling statistics' });
+                console.error('Error getting leveling stats:', error);
+                res.status(500).json({ error: 'Internal server error' });
             }
         });
 
-        // Get leveling settings
+        // Get leaderboard
+        this.app.get('/api/plugins/leveling/leaderboard/:guildId', this.ensureAuthenticated, async (req, res) => {
+            try {
+                const { guildId } = req.params;
+                const { type = 'overall', limit = 50 } = req.query;
+                
+                if (!await this.hasAdminPermissions(req.user.id, guildId)) {
+                    return res.status(403).json({ error: 'Insufficient permissions' });
+                }
+
+                const data = await this.loadData();
+                const guild = await this.client.guilds.fetch(guildId);
+                
+                // Get all users for this guild
+                const guildUsers = [];
+                for (const userId in data.users) {
+                    const userGuildData = data.users[userId][guildId];
+                    if (userGuildData) {
+                        try {
+                            const member = await guild.members.fetch(userId).catch(() => null);
+                            if (member) {
+                                guildUsers.push({
+                                    userId,
+                                    username: member.user.username,
+                                    displayName: member.displayName,
+                                    avatar: member.user.displayAvatarURL({ format: 'png', size: 128 }),
+                                    ...userGuildData
+                                });
+                            }
+                        } catch (error) {
+                            // User not in guild anymore
+                        }
+                    }
+                }
+
+                // Sort based on type
+                let sortedUsers = [];
+                switch (type) {
+                    case 'voice':
+                        sortedUsers = guildUsers.sort((a, b) => (b.voiceTime || 0) - (a.voiceTime || 0));
+                        break;
+                    case 'reactions':
+                        sortedUsers = guildUsers.sort((a, b) => (b.reactionsGiven || 0) - (a.reactionsGiven || 0));
+                        break;
+                    default: // overall
+                        sortedUsers = guildUsers.sort((a, b) => b.xp - a.xp);
+                }
+
+                res.json(sortedUsers.slice(0, parseInt(limit)));
+            } catch (error) {
+                console.error('Error getting leaderboard:', error);
+                res.status(500).json({ error: 'Internal server error' });
+            }
+        });
+
+        // Get settings
         this.app.get('/api/plugins/leveling/settings/:guildId', this.ensureAuthenticated, async (req, res) => {
             try {
                 const { guildId } = req.params;
@@ -96,16 +160,28 @@ class LevelingPlugin {
                 }
 
                 const settings = await this.loadSettings();
-                const guildSettings = settings[guildId] || this.getDefaultSettings();
-                
+                const guildSettings = settings[guildId] || {
+                    enabled: true,
+                    xpSources: {
+                        messages: true,
+                        voice: false,
+                        reactions: false
+                    },
+                    xpMultiplier: 1,
+                    levelUpChannel: null,
+                    levelUpMessage: '🎉 {user} reached level {level}!',
+                    excludedChannels: [],
+                    excludedRoles: []
+                };
+
                 res.json(guildSettings);
             } catch (error) {
-                console.error('Error fetching leveling settings:', error);
-                res.status(500).json({ error: 'Failed to fetch settings' });
+                console.error('Error getting settings:', error);
+                res.status(500).json({ error: 'Internal server error' });
             }
         });
 
-        // Update leveling settings
+        // Save settings
         this.app.post('/api/plugins/leveling/settings/:guildId', this.ensureAuthenticated, async (req, res) => {
             try {
                 const { guildId } = req.params;
@@ -116,73 +192,24 @@ class LevelingPlugin {
 
                 const settings = await this.loadSettings();
                 settings[guildId] = {
-                    ...this.getDefaultSettings(),
+                    ...settings[guildId],
                     ...req.body,
                     updatedAt: new Date().toISOString()
                 };
 
-                await fs.writeFile(this.settingsPath, JSON.stringify(settings, null, 2));
-                
-                res.json({ success: true, message: 'Settings updated successfully' });
+                await this.saveSettings(settings);
+                res.json({ success: true });
             } catch (error) {
-                console.error('Error updating leveling settings:', error);
-                res.status(500).json({ error: 'Failed to update settings' });
-            }
-        });
-
-        // Get leaderboard data
-        this.app.get('/api/plugins/leveling/leaderboard/:guildId', this.ensureAuthenticated, async (req, res) => {
-            try {
-                const { guildId } = req.params;
-                const { type = 'overall', limit = 10 } = req.query;
-                
-                if (!await this.hasAdminPermissions(req.user.id, guildId)) {
-                    return res.status(403).json({ error: 'Insufficient permissions' });
-                }
-
-                const leaderboard = await this.generateLeaderboard(guildId, type, parseInt(limit));
-                
-                const enrichedLeaderboard = await Promise.all(
-                    leaderboard.map(async (entry, index) => {
-                        try {
-                            const user = await this.client.users.fetch(entry.userId);
-                            return {
-                                rank: index + 1,
-                                userId: entry.userId,
-                                username: user.username,
-                                displayName: user.displayName || user.username,
-                                avatar: user.displayAvatarURL({ size: 64 }),
-                                value: entry.value,
-                                level: entry.level,
-                                progressToNext: this.calculateProgress(entry.xp || entry.value)
-                            };
-                        } catch {
-                            return {
-                                rank: index + 1,
-                                userId: entry.userId,
-                                username: 'Unknown User',
-                                displayName: 'Unknown User',
-                                avatar: null,
-                                value: entry.value,
-                                level: entry.level,
-                                progressToNext: 0
-                            };
-                        }
-                    })
-                );
-
-                res.json(enrichedLeaderboard);
-            } catch (error) {
-                console.error('Error fetching leaderboard:', error);
-                res.status(500).json({ error: 'Failed to fetch leaderboard' });
+                console.error('Error saving settings:', error);
+                res.status(500).json({ error: 'Internal server error' });
             }
         });
 
         // Admin XP management
-        this.app.post('/api/plugins/leveling/manage-xp/:guildId', this.ensureAuthenticated, async (req, res) => {
+        this.app.post('/api/plugins/leveling/admin/:action', this.ensureAuthenticated, async (req, res) => {
             try {
-                const { guildId } = req.params;
-                const { userId, amount, action } = req.body;
+                const { action } = req.params;
+                const { userId, guildId, amount } = req.body;
                 
                 if (!await this.hasAdminPermissions(req.user.id, guildId)) {
                     return res.status(403).json({ error: 'Insufficient permissions' });
@@ -190,48 +217,37 @@ class LevelingPlugin {
 
                 const data = await this.loadData();
                 
-                if (!data.users[userId]) {
-                    data.users[userId] = {};
-                }
-                
+                if (!data.users[userId]) data.users[userId] = {};
                 if (!data.users[userId][guildId]) {
                     data.users[userId][guildId] = {
-                        xp: 0, level: 0, voiceTime: 0, 
+                        xp: 0, level: 0, voiceTime: 0,
                         reactionsGiven: 0, reactionsReceived: 0
                     };
                 }
 
                 const userData = data.users[userId][guildId];
-                const oldXP = userData.xp;
                 
                 switch (action) {
                     case 'add':
-                        userData.xp += Math.max(0, parseInt(amount));
+                        userData.xp += amount;
                         break;
                     case 'remove':
-                        userData.xp = Math.max(0, userData.xp - Math.max(0, parseInt(amount)));
+                        userData.xp = Math.max(0, userData.xp - amount);
                         break;
                     case 'set':
-                        userData.xp = Math.max(0, parseInt(amount));
+                        userData.xp = Math.max(0, amount);
                         break;
                     default:
                         return res.status(400).json({ error: 'Invalid action' });
                 }
 
                 userData.level = this.calculateLevel(userData.xp);
+                await this.saveData(data);
                 
-                await fs.writeFile(this.dataPath, JSON.stringify(data, null, 2));
-                
-                res.json({ 
-                    success: true, 
-                    message: `Successfully ${action}ed ${Math.abs(amount)} XP`,
-                    oldXP,
-                    newXP: userData.xp,
-                    newLevel: userData.level
-                });
+                res.json({ success: true, newXP: userData.xp, newLevel: userData.level });
             } catch (error) {
                 console.error('Error managing XP:', error);
-                res.status(500).json({ error: 'Failed to manage XP' });
+                res.status(500).json({ error: 'Internal server error' });
             }
         });
 
@@ -251,20 +267,42 @@ class LevelingPlugin {
                     guildId,
                     exportedAt: new Date().toISOString(),
                     settings: settings[guildId] || {},
-                    users: Object.keys(data.users).reduce((acc, userId) => {
-                        if (data.users[userId][guildId]) {
-                            acc[userId] = data.users[userId][guildId];
-                        }
-                        return acc;
-                    }, {})
+                    users: {}
                 };
 
+                // Extract only this guild's user data
+                for (const userId in data.users) {
+                    if (data.users[userId][guildId]) {
+                        exportData.users[userId] = data.users[userId][guildId];
+                    }
+                }
+
                 res.setHeader('Content-Type', 'application/json');
-                res.setHeader('Content-Disposition', `attachment; filename="leveling-data-${guildId}-${Date.now()}.json"`);
-                res.send(JSON.stringify(exportData, null, 2));
+                res.setHeader('Content-Disposition', `attachment; filename=leveling-data-${guildId}.json`);
+                res.json(exportData);
             } catch (error) {
                 console.error('Error exporting data:', error);
-                res.status(500).json({ error: 'Failed to export data' });
+                res.status(500).json({ error: 'Internal server error' });
+            }
+        });
+
+        // Reset settings
+        this.app.post('/api/plugins/leveling/reset/:guildId', this.ensureAuthenticated, async (req, res) => {
+            try {
+                const { guildId } = req.params;
+                
+                if (!await this.hasAdminPermissions(req.user.id, guildId)) {
+                    return res.status(403).json({ error: 'Insufficient permissions' });
+                }
+
+                const settings = await this.loadSettings();
+                delete settings[guildId];
+                await this.saveSettings(settings);
+                
+                res.json({ success: true });
+            } catch (error) {
+                console.error('Error resetting settings:', error);
+                res.status(500).json({ error: 'Internal server error' });
             }
         });
     }
@@ -273,39 +311,74 @@ class LevelingPlugin {
         // Message XP
         this.client.on('messageCreate', async (message) => {
             if (message.author.bot || !message.guild) return;
-            
+
             const settings = await this.loadSettings();
             const guildSettings = settings[message.guild.id];
             
             if (!guildSettings?.xpSources?.messages) return;
+
+            // Check cooldown (60 seconds)
+            const userId = message.author.id;
+            const cooldownKey = `${userId}-${message.guild.id}`;
+            const now = Date.now();
             
-            await this.addXP(message.author.id, message.guild.id, 'message', guildSettings);
+            if (this.messageCooldowns.has(cooldownKey)) {
+                const lastMessage = this.messageCooldowns.get(cooldownKey);
+                if (now - lastMessage < 60000) return; // 60 second cooldown
+            }
+
+            this.messageCooldowns.set(cooldownKey, now);
+            await this.addXP(userId, message.guild.id, 'message', guildSettings);
         });
 
-        // Voice XP
+        // Voice XP tracking
         this.client.on('voiceStateUpdate', async (oldState, newState) => {
+            const settings = await this.loadSettings();
             const guildId = newState.guild?.id || oldState.guild?.id;
             if (!guildId) return;
-            
-            const settings = await this.loadSettings();
+
             const guildSettings = settings[guildId];
-            
             if (!guildSettings?.xpSources?.voice) return;
-            
-            if (!oldState.channelId && newState.channelId) {
-                this.voiceSessions = this.voiceSessions || {};
-                this.voiceSessions[`${guildId}-${newState.id}`] = Date.now();
+
+            const userId = newState.member?.id || oldState.member?.id;
+            if (!userId) return;
+
+            const now = Date.now();
+
+            // User joined voice
+            if (!oldState.channel && newState.channel) {
+                this.voiceTracker.set(`${userId}-${guildId}`, now);
             }
-            
-            if (oldState.channelId && !newState.channelId) {
-                const sessionKey = `${guildId}-${newState.id}`;
-                if (this.voiceSessions?.[sessionKey]) {
-                    const sessionTime = Math.floor((Date.now() - this.voiceSessions[sessionKey]) / 60000);
-                    delete this.voiceSessions[sessionKey];
-                    
-                    if (sessionTime >= 1) {
-                        await this.addVoiceTime(newState.id, guildId, sessionTime, guildSettings);
+            // User left voice
+            else if (oldState.channel && !newState.channel) {
+                const joinTime = this.voiceTracker.get(`${userId}-${guildId}`);
+                if (joinTime) {
+                    const timeSpent = Math.floor((now - joinTime) / 60000); // minutes
+                    if (timeSpent > 0) {
+                        const data = await this.loadData();
+                        if (!data.users[userId]) data.users[userId] = {};
+                        if (!data.users[userId][guildId]) {
+                            data.users[userId][guildId] = {
+                                xp: 0, level: 0, voiceTime: 0,
+                                reactionsGiven: 0, reactionsReceived: 0
+                            };
+                        }
+
+                        const userData = data.users[userId][guildId];
+                        const oldLevel = userData.level;
+                        
+                        userData.voiceTime += timeSpent;
+                        userData.xp += timeSpent; // 1 XP per minute
+                        userData.level = this.calculateLevel(userData.xp);
+
+                        await this.saveData(data);
+
+                        // Level up check
+                        if (userData.level > oldLevel && guildSettings.levelUpChannel) {
+                            await this.sendLevelUpMessage(userId, guildId, userData.level, guildSettings);
+                        }
                     }
+                    this.voiceTracker.delete(`${userId}-${guildId}`);
                 }
             }
         });
@@ -313,108 +386,131 @@ class LevelingPlugin {
         // Reaction XP
         this.client.on('messageReactionAdd', async (reaction, user) => {
             if (user.bot || !reaction.message.guild) return;
-            
+
             const settings = await this.loadSettings();
             const guildSettings = settings[reaction.message.guild.id];
             
             if (!guildSettings?.xpSources?.reactions) return;
+
+            await this.addXP(user.id, reaction.message.guild.id, 'reaction', guildSettings);
             
-            await this.addReaction(user.id, reaction.message.guild.id, 'given', guildSettings);
-            await this.addReaction(reaction.message.author.id, reaction.message.guild.id, 'received', guildSettings);
-        });
-
-        // Slash commands
-        this.client.on('interactionCreate', async (interaction) => {
-            if (!interaction.isChatInputCommand()) return;
-
-            try {
-                switch (interaction.commandName) {
-                    case 'level':
-                        await this.handleLevelCommand(interaction);
-                        break;
-                    case 'leaderboard':
-                        await this.handleLeaderboardCommand(interaction);
-                        break;
-                }
-            } catch (error) {
-                console.error('Error handling slash command:', error);
-                const errorMessage = 'An error occurred while processing this command.';
+            // Also give XP to the message author (reaction received)
+            if (reaction.message.author && !reaction.message.author.bot) {
+                const data = await this.loadData();
+                const authorId = reaction.message.author.id;
+                const guildId = reaction.message.guild.id;
                 
-                if (interaction.deferred || interaction.replied) {
-                    await interaction.editReply(errorMessage);
-                } else {
-                    await interaction.reply({ content: errorMessage, ephemeral: true });
+                if (!data.users[authorId]) data.users[authorId] = {};
+                if (!data.users[authorId][guildId]) {
+                    data.users[authorId][guildId] = {
+                        xp: 0, level: 0, voiceTime: 0,
+                        reactionsGiven: 0, reactionsReceived: 0
+                    };
                 }
+
+                data.users[authorId][guildId].reactionsReceived += 1;
+                data.users[authorId][guildId].xp += 2; // 2 XP for receiving reaction
+                data.users[authorId][guildId].level = this.calculateLevel(data.users[authorId][guildId].xp);
+                
+                await this.saveData(data);
             }
         });
     }
 
     async registerSlashCommands() {
-        if (!this.client.isReady()) {
-            this.client.once('ready', () => {
-                this.registerSlashCommands();
-            });
-            return;
-        }
-
-        const commands = [
-            {
-                name: 'level',
-                description: 'Check your or someone else\'s level and XP',
-                options: [{
-                    name: 'user',
-                    description: 'The user to check (defaults to yourself)',
-                    type: 6,
-                    required: false
-                }]
-            },
-            {
-                name: 'leaderboard',
-                description: 'View server leaderboards',
-                options: [
-                    {
-                        name: 'type',
-                        description: 'Type of leaderboard',
-                        type: 3,
-                        required: false,
-                        choices: [
-                            { name: 'Overall XP', value: 'overall' },
-                            { name: 'Voice Activity', value: 'voice' },
-                            { name: 'Reactions', value: 'reactions' }
-                        ]
-                    },
-                    {
-                        name: 'limit',
-                        description: 'Number of users to show (1-25)',
-                        type: 4,
-                        required: false,
-                        min_value: 1,
-                        max_value: 25
-                    }
-                ]
-            }
-        ];
-
         try {
-            await this.client.application.commands.set(commands);
+            const commands = [
+                {
+                    name: 'level',
+                    description: 'Check your or someone else\'s level',
+                    options: [
+                        {
+                            name: 'user',
+                            description: 'User to check level for',
+                            type: 6, // USER
+                            required: false
+                        }
+                    ]
+                },
+                {
+                    name: 'leaderboard',
+                    description: 'Show the server leaderboard',
+                    options: [
+                        {
+                            name: 'type',
+                            description: 'Type of leaderboard',
+                            type: 3, // STRING
+                            required: false,
+                            choices: [
+                                { name: 'Overall XP', value: 'overall' },
+                                { name: 'Voice Activity', value: 'voice' },
+                                { name: 'Reactions', value: 'reactions' }
+                            ]
+                        }
+                    ]
+                }
+            ];
+
+            for (const guild of this.client.guilds.cache.values()) {
+                try {
+                    await guild.commands.set(commands);
+                } catch (error) {
+                    console.error(`Failed to register commands for guild ${guild.id}:`, error);
+                }
+            }
+
             console.log('✅ Leveling slash commands registered');
         } catch (error) {
-            console.error('❌ Error registering leveling commands:', error);
+            console.error('Error registering slash commands:', error);
         }
     }
 
-    getDefaultSettings() {
-        return {
-            xpSources: {
-                messages: true,
-                voice: true,
-                reactions: true
-            },
-            xpMultiplier: 1.0,
-            levelUpChannel: null,
-            levelUpMessage: '🎉 {user} reached level {level}!',
-            createdAt: new Date().toISOString()
-        };
+    async addXP(userId, guildId, source, guildSettings) {
+        const data = await this.loadData();
+        
+        if (!data.users[userId]) data.users[userId] = {};
+        if (!data.users[userId][guildId]) {
+            data.users[userId][guildId] = {
+                xp: 0, level: 0, voiceTime: 0,
+                reactionsGiven: 0, reactionsReceived: 0
+            };
+        }
+
+        const userData = data.users[userId][guildId];
+        const baseXP = source === 'message' ? Math.floor(Math.random() * 15) + 10 : 
+                      source === 'reaction' ? 5 : 1;
+        const xpGain = Math.floor(baseXP * (guildSettings.xpMultiplier || 1));
+        
+        const oldLevel = userData.level;
+        userData.xp += xpGain;
+        userData.level = this.calculateLevel(userData.xp);
+
+        if (source === 'reaction') {
+            userData.reactionsGiven += 1;
+        }
+
+        await this.saveData(data);
+
+        // Level up notification
+        if (userData.level > oldLevel && guildSettings.levelUpChannel) {
+            await this.sendLevelUpMessage(userId, guildId, userData.level, guildSettings);
+        }
+
+        return { xpGain, newLevel: userData.level, leveledUp: userData.level > oldLevel };
+    }
+
+    async sendLevelUpMessage(userId, guildId, level, guildSettings) {
+        try {
+            const channel = await this.client.channels.fetch(guildSettings.levelUpChannel);
+            const user = await this.client.users.fetch(userId);
+            const message = (guildSettings.levelUpMessage || '🎉 {user} reached level {level}!')
+                .replace('{user}', `<@${userId}>`)
+                .replace('{level}', level);
+
+            await channel.send(message);
+        } catch (error) {
+            console.error('Error sending level up message:', error);
+        }
     }
 
     async loadData() {
@@ -423,6 +519,14 @@ class LevelingPlugin {
             return JSON.parse(data);
         } catch {
             return { users: {} };
+        }
+    }
+
+    async saveData(data) {
+        try {
+            await fs.writeFile(this.dataPath, JSON.stringify(data, null, 2));
+        } catch (error) {
+            console.error('Error saving leveling data:', error);
         }
     }
 
@@ -435,9 +539,17 @@ class LevelingPlugin {
         }
     }
 
+    async saveSettings(settings) {
+        try {
+            await fs.writeFile(this.settingsPath, JSON.stringify(settings, null, 2));
+        } catch (error) {
+            console.error('Error saving settings:', error);
+        }
+    }
+
     isLevelingEnabled(guildId, settings) {
         const guildSettings = settings[guildId];
-        return guildSettings && (
+        return guildSettings && guildSettings.enabled && (
             guildSettings.xpSources?.messages || 
             guildSettings.xpSources?.voice || 
             guildSettings.xpSources?.reactions
@@ -467,260 +579,815 @@ class LevelingPlugin {
         return Math.floor((progress / total) * 100);
     }
 
-    async addXP(userId, guildId, source, guildSettings) {
-        const data = await this.loadData();
-        
-        if (!data.users[userId]) data.users[userId] = {};
-        if (!data.users[userId][guildId]) {
-            data.users[userId][guildId] = {
-                xp: 0, level: 0, voiceTime: 0,
-                reactionsGiven: 0, reactionsReceived: 0
-            };
-        }
-
-        const userData = data.users[userId][guildId];
-        const baseXP = source === 'message' ? Math.floor(Math.random() * 15) + 10 : 5;
-        const xpGain = Math.floor(baseXP * (guildSettings.xpMultiplier || 1));
-        
-        const oldLevel = userData.level;
-        userData.xp += xpGain;
-        userData.level = this.calculateLevel(userData.xp);
-
-        if (userData.level > oldLevel && guildSettings.levelUpChannel) {
-            try {
-                const channel = await this.client.channels.fetch(guildSettings.levelUpChannel);
-                const user = await this.client.users.fetch(userId);
-                const message = (guildSettings.levelUpMessage || '🎉 {user} reached level {level}!')
-                    .replace('{user}', `<@${userId}>`)
-                    .replace('{level}', userData.level);
-                await channel.send(message);
-            } catch (error) {
-                console.error('Error sending level up message:', error);
-            }
-        }
-
-        await fs.writeFile(this.dataPath, JSON.stringify(data, null, 2));
-    }
-
-    async addVoiceTime(userId, guildId, minutes, guildSettings) {
-        const data = await this.loadData();
-        
-        if (!data.users[userId]) data.users[userId] = {};
-        if (!data.users[userId][guildId]) {
-            data.users[userId][guildId] = {
-                xp: 0, level: 0, voiceTime: 0,
-                reactionsGiven: 0, reactionsReceived: 0
-            };
-        }
-
-        const userData = data.users[userId][guildId];
-        userData.voiceTime += minutes;
-        
-        const xpGain = Math.floor(minutes * (guildSettings.xpMultiplier || 1));
-        userData.xp += xpGain;
-        userData.level = this.calculateLevel(userData.xp);
-
-        await fs.writeFile(this.dataPath, JSON.stringify(data, null, 2));
-    }
-
-    async addReaction(userId, guildId, type, guildSettings) {
-        const data = await this.loadData();
-        
-        if (!data.users[userId]) data.users[userId] = {};
-        if (!data.users[userId][guildId]) {
-            data.users[userId][guildId] = {
-                xp: 0, level: 0, voiceTime: 0,
-                reactionsGiven: 0, reactionsReceived: 0
-            };
-        }
-
-        const userData = data.users[userId][guildId];
-        
-        if (type === 'given') {
-            userData.reactionsGiven++;
-        } else {
-            userData.reactionsReceived++;
-        }
-        
-        const xpGain = Math.floor(2 * (guildSettings.xpMultiplier || 1));
-        userData.xp += xpGain;
-        userData.level = this.calculateLevel(userData.xp);
-
-        await fs.writeFile(this.dataPath, JSON.stringify(data, null, 2));
-    }
-
-    async generateLeaderboard(guildId, type = 'overall', limit = 10) {
-        const data = await this.loadData();
-        const users = [];
-
-        Object.keys(data.users).forEach(userId => {
-            const userData = data.users[userId][guildId];
-            if (!userData) return;
-
-            let value;
-            switch (type) {
-                case 'voice':
-                    value = userData.voiceTime || 0;
-                    break;
-                case 'reactions':
-                    value = (userData.reactionsGiven || 0) + (userData.reactionsReceived || 0);
-                    break;
-                default:
-                    value = userData.xp || 0;
-            }
-
-            if (value > 0) {
-                users.push({
-                    userId,
-                    value,
-                    level: userData.level || 0,
-                    xp: userData.xp || 0
-                });
-            }
-        });
-
-        return users
-            .sort((a, b) => b.value - a.value)
-            .slice(0, limit);
-    }
-
-    async handleLevelCommand(interaction) {
-        try {
-            await interaction.deferReply();
-
-            const targetUser = interaction.options.getUser('user') || interaction.user;
-            const guildId = interaction.guildId;
-
-            if (!guildId) {
-                return await interaction.editReply('This command can only be used in a server!');
-            }
-
-            const settings = await this.loadSettings();
-            const guildSettings = settings[guildId];
-            
-            if (!guildSettings || (!guildSettings.xpSources?.messages && !guildSettings.xpSources?.voice && !guildSettings.xpSources?.reactions)) {
-                return await interaction.editReply('❌ Leveling system is not enabled on this server.');
-            }
-
-            const data = await this.loadData();
-            const userData = data.users[targetUser.id]?.[guildId] || {
-                xp: 0, level: 0, voiceTime: 0, reactionsGiven: 0, reactionsReceived: 0
-            };
-
-            const xpNeeded = this.getXPNeededForNextLevel(userData.xp);
-            const xpForCurrentLevel = this.getXPForLevel(userData.level);
-            const xpProgress = userData.xp - xpForCurrentLevel;
-            const xpForNextLevel = this.getXPForLevel(userData.level + 1) - xpForCurrentLevel;
-            const progressPercentage = Math.floor((xpProgress / xpForNextLevel) * 100);
-
-            const embed = {
-                color: 0x4f46e5,
-                title: `${targetUser.username}'s Level`,
-                thumbnail: { url: targetUser.displayAvatarURL() },
-                fields: [
-                    { name: '📊 Level', value: userData.level.toString(), inline: true },
-                    { name: '⭐ Total XP', value: userData.xp.toLocaleString(), inline: true },
-                    { name: '🎯 XP to Next Level', value: xpNeeded.toLocaleString(), inline: true },
-                    { name: '📈 Progress', value: `${xpProgress.toLocaleString()}/${xpForNextLevel.toLocaleString()} (${progressPercentage}%)`, inline: false }
-                ],
-                footer: { text: `Voice: ${userData.voiceTime}min | Reactions: ${userData.reactionsGiven + userData.reactionsReceived}` }
-            };
-
-            await interaction.editReply({ embeds: [embed] });
-        } catch (error) {
-            console.error('Error handling level command:', error);
-            await interaction.editReply('❌ An error occurred while fetching level data.');
-        }
-    }
-
-    async handleLeaderboardCommand(interaction) {
-        try {
-            await interaction.deferReply();
-
-            const type = interaction.options.getString('type') || 'overall';
-            const limit = interaction.options.getInteger('limit') || 10;
-            const guildId = interaction.guildId;
-
-            if (!guildId) {
-                return await interaction.editReply('This command can only be used in a server!');
-            }
-
-            const leaderboard = await this.generateLeaderboard(guildId, type, limit);
-
-            if (leaderboard.length === 0) {
-                return await interaction.editReply('❌ No data available for the leaderboard.');
-            }
-
-            const enrichedLeaderboard = await Promise.all(
-                leaderboard.map(async (entry, index) => {
-                    try {
-                        const user = await this.client.users.fetch(entry.userId);
-                        return {
-                            rank: index + 1,
-                            username: user.username,
-                            value: entry.value,
-                            level: entry.level
-                        };
-                    } catch {
-                        return {
-                            rank: index + 1,
-                            username: 'Unknown User',
-                            value: entry.value,
-                            level: entry.level
-                        };
-                    }
-                })
-            );
-
-            const leaderboardText = enrichedLeaderboard
-                .map(entry => {
-                    const emoji = entry.rank === 1 ? '🥇' : entry.rank === 2 ? '🥈' : entry.rank === 3 ? '🥉' : '📍';
-                    let valueText;
-                    
-                    switch (type) {
-                        case 'voice':
-                            valueText = `${entry.value} minutes`;
-                            break;
-                        case 'reactions':
-                            valueText = `${entry.value} reactions`;
-                            break;
-                        default:
-                            valueText = `${entry.value.toLocaleString()} XP (Level ${entry.level})`;
-                    }
-                    
-                    return `${emoji} **${entry.rank}.** ${entry.username} - ${valueText}`;
-                })
-                .join('\n');
-
-            const typeNames = {
-                overall: 'Overall XP',
-                voice: 'Voice Activity',
-                reactions: 'Reactions'
-            };
-
-            const embed = {
-                color: 0x22c55e,
-                title: `🏆 ${typeNames[type]} Leaderboard`,
-                description: leaderboardText,
-                footer: { text: `Showing top ${enrichedLeaderboard.length} users` }
-            };
-
-            await interaction.editReply({ embeds: [embed] });
-        } catch (error) {
-            console.error('Error handling leaderboard command:', error);
-            await interaction.editReply('❌ An error occurred while fetching leaderboard data.');
-        }
-    }
-
     getFrontendComponent() {
         return {
-            id: 'leveling',
+            id: 'leveling-system',
             name: 'Leveling System',
             description: 'XP and leveling system with multiple sources and leaderboards',
             icon: '📈',
             containerId: 'levelingPluginContainer',
-            html: `<div class="plugin-container"><div class="page-header"><div><h1 class="page-title">Leveling System</h1><p class="page-subtitle">Configure XP sources, view leaderboards, and manage user levels</p></div><div><button id="exportLevelingData" class="btn btn-secondary">📤 Export Data</button></div></div><div class="stats-section"><div class="stats-grid"><div class="stat-card"><div class="stat-icon" style="background: linear-gradient(135deg, #4f46e5, #7c3aed);">📊</div><div class="stat-content"><div class="stat-value" id="activeUsersCount">0</div><div class="stat-label">Active Users</div></div></div><div class="stat-card"><div class="stat-icon" style="background: linear-gradient(135deg, #22c55e, #16a34a);">⭐</div><div class="stat-content"><div class="stat-value" id="totalXPCount">0</div><div class="stat-label">Total XP</div></div></div><div class="stat-card"><div class="stat-icon" style="background: linear-gradient(135deg, #f59e0b, #d97706);">🎯</div><div class="stat-content"><div class="stat-value" id="maxLevelCount">0</div><div class="stat-label">Highest Level</div></div></div><div class="stat-card"><div class="stat-icon" style="background: linear-gradient(135deg, #ef4444, #dc2626);">🎤</div><div class="stat-content"><div class="stat-value" id="voiceTimeCount">0</div><div class="stat-label">Voice Minutes</div></div></div></div></div><div class="widget"><div class="widget-header"><h3>⚙️ Leveling Settings</h3><span id="levelingStatus" class="status-badge status-inactive">Disabled</span></div><div class="widget-content"><form id="levelingSettingsForm"><div class="form-row"><div class="form-group"><label>XP Sources</label><div class="checkbox-group"><label><input type="checkbox" id="xpSourceMessages"> 💬 Messages (10-25 XP)</label><label><input type="checkbox" id="xpSourceVoice"> 🎤 Voice Activity (1 XP/min)</label><label><input type="checkbox" id="xpSourceReactions"> 😄 Reactions (2 XP each)</label></div></div><div class="form-group"><label for="xpMultiplier">XP Multiplier</label><input type="number" id="xpMultiplier" class="form-control" min="0.1" max="10" step="0.1" value="1.0"><small>Multiply all XP gains (0.1x to 10x)</small></div></div><div class="form-row"><div class="form-group"><label for="levelUpChannel">Level Up Channel</label><select id="levelUpChannel" class="form-control"><option value="">Select a channel...</option></select></div><div class="form-group"><label for="levelUpMessage">Level Up Message</label><input type="text" id="levelUpMessage" class="form-control" placeholder="🎉 {user} reached level {level}!" value="🎉 {user} reached level {level}!"><small>Use {user} and {level} placeholders</small></div></div><div class="btn-group"><button type="submit" id="saveLevelingSettings" class="btn btn-primary">💾 Save Settings</button><button type="button" id="resetLevelingSettings" class="btn btn-secondary">🔄 Reset</button></div></form></div></div><div class="widget"><div class="widget-header"><h3>🏆 Leaderboards</h3><div class="leaderboard-tabs"><button class="tab-btn active" data-type="overall">Overall XP</button><button class="tab-btn" data-type="voice">Voice Activity</button><button class="tab-btn" data-type="reactions">Reactions</button></div></div><div class="widget-content"><div id="leaderboardContent"><div id="leaderboardLoading" style="display: none;">Loading leaderboard...</div><div id="leaderboardList"></div></div></div></div><div class="widget"><div class="widget-header"><h3>👑 Admin Management</h3></div><div class="widget-content"><div class="form-row"><div class="form-group"><label for="adminUserId">User ID</label><input type="text" id="adminUserId" class="form-control" placeholder="Enter Discord User ID"></div><div class="form-group"><label for="adminXpAmount">XP Amount</label><input type="number" id="adminXpAmount" class="form-control" placeholder="Enter XP amount" min="1"></div></div><div class="btn-group"><button id="addXpBtn" class="btn btn-success" data-action="add">➕ Add XP</button><button id="removeXpBtn" class="btn btn-warning" data-action="remove">➖ Remove XP</button><button id="setXpBtn" class="btn btn-danger" data-action="set">🎯 Set XP</button></div></div></div></div>`,
-            script: `(function(){console.log("📈 Leveling Plugin script starting...");let a=null,b="overall",c={};const d=document.getElementById("serverDropdown");function e(){console.log("🚀 Leveling Plugin initializing..."),f(),d&&d.value&&(a=d.value,g())}function f(){d&&d.addEventListener("change",h);const e=document.getElementById("levelingSettingsForm");e&&e.addEventListener("submit",i),document.addEventListener("click",function(a){const c=a.target.closest(".tab-btn");c&&c.dataset.type&&j(a)});const f=document.getElementById("exportLevelingData");f&&f.addEventListener("click",k);const g=document.getElementById("resetLevelingSettings");g&&g.addEventListener("click",l);["addXpBtn","removeXpBtn","setXpBtn"].forEach(a=>{const b=document.getElementById(a);b&&b.addEventListener("click",m)}),setInterval(n,3e4)}async function g(){a&&await Promise.all([o(),p(),q(),r()])}async function h(){a=d.value,a&&await g()}async function o(){if(!a)return;try{const b=await fetch("/api/plugins/leveling/settings/"+a);if(!b.ok)throw new Error("Failed to load settings");c=await b.json(),s(),t()}catch(a){console.error("Error loading settings:",a)}}async function p(){if(!a)return;try{const b=await fetch("/api/plugins/leveling/stats/"+a);if(!b.ok)throw new Error("Failed to load stats");const c=await b.json();u(c)}catch(a){console.error("Error loading stats:",a)}}async function q(){if(!a)return;try{const b=await fetch("/api/channels/"+a);if(!b.ok)throw new Error("Failed to load channels");const c=await b.json();v(c)}catch(a){console.error("Error loading channels:",a)}}async function r(){if(!a)return;const c=document.getElementById("leaderboardLoading"),d=document.getElementById("leaderboardList");c&&(c.style.display="block"),d&&(d.innerHTML="");try{const c=await fetch("/api/plugins/leveling/leaderboard/"+a+"?type="+b+"&limit=10");if(!c.ok)throw new Error("Failed to load leaderboard");const e=await c.json();w(e)}catch(a){console.error("Error loading leaderboard:",a),d&&(d.innerHTML='<div class="empty-state">Failed to load leaderboard</div>')}finally{c&&(c.style.display="none")}}function s(){const a={xpSourceMessages:c.xpSources?.messages||!1,xpSourceVoice:c.xpSources?.voice||!1,xpSourceReactions:c.xpSources?.reactions||!1,xpMultiplier:c.xpMultiplier||1,levelUpChannel:c.levelUpChannel||"",levelUpMessage:c.levelUpMessage||"🎉 {user} reached level {level}!"};Object.keys(a).forEach(b=>{const c=document.getElementById(b);c&&("checkbox"===c.type?c.checked=a[b]:c.value=a[b])})}function v(a){const b=document.getElementById("levelUpChannel");b&&(b.innerHTML='<option value="">Select a channel...</option>',a.forEach(a=>{if(0===a.type){const c=document.createElement("option");c.value=a.id,c.textContent="#"+a.name,b.appendChild(c)}}),c.levelUpChannel&&(b.value=c.levelUpChannel))}function u(a){const b={activeUsersCount:a.serverUsers||0,totalXPCount:a.totalXP||0,maxLevelCount:a.maxLevel||0,voiceTimeCount:Math.floor(a.totalVoiceTime||0)};Object.keys(b).forEach(a=>{const c=document.getElementById(a);if(c){const d=b[a];c.textContent="number"==typeof d?d.toLocaleString():d}})}function t(){const a=document.getElementById("levelingStatus");if(!a)return;const b=c.xpSources?.messages||c.xpSources?.voice||c.xpSources?.reactions;b?(a.textContent="Active",a.className="status-badge status-active"):(a.textContent="Disabled",a.className="status-badge status-inactive")}function w(a){const c=document.getElementById("leaderboardList");if(!c)return;if(!a||0===a.length)return void(c.innerHTML='<div class="empty-state">No data available</div>');const d=a.map((a,c)=>{const d=c+1,e=1===d?"🥇":2===d?"🥈":3===d?"🥉":"📍",f=a.value||0;let g;switch(b){case"voice":g=f+" minutes";break;case"reactions":g=f+" reactions";break;default:g=f.toLocaleString()+" XP"}const h=a.displayName||a.username||"Unknown User",i=a.avatar,j=a.level||0,k=a.progressToNext||0;return'<div class="leaderboard-item"><div class="rank">'+e+'</div><div class="member-info"><div class="member-avatar">'+(i?'<img src="'+i+'" alt="'+h+'">':h.charAt(0).toUpperCase())+'</div><div class="member-details"><div class="member-name">'+h+'</div><div class="member-stats">'+g+"</div></div></div>"+("overall"===b?'<div class="member-progress"><div class="progress-bar"><div class="progress-fill" style="width: '+k+'%"></div></div><small style="color: var(--text-muted); font-size: 11px;">Level '+j+"</small></div>":"")+"</div>"}).join("");c.innerHTML=d}async function i(b){if(b.preventDefault(),!a)return;const d=document.getElementById("saveLevelingSettings");d&&(d.disabled=!0,d.textContent="Saving...");try{const b={xpSources:{messages:document.getElementById("xpSourceMessages").checked,voice:document.getElementById("xpSourceVoice").checked,reactions:document.getElementById("xpSourceReactions").checked},xpMultiplier:parseFloat(document.getElementById("xpMultiplier").value)||1,levelUpChannel:document.getElementById("levelUpChannel").value||null,levelUpMessage:document.getElementById("levelUpMessage").value||"🎉 {user} reached level {level}!"},e=await fetch("/api/plugins/leveling/settings/"+a,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});if(!e.ok)throw new Error("Failed to save settings");c=Object.assign(c,b),t(),x("Settings saved successfully!","success")}catch(a){console.error("Error saving settings:",a),x("Failed to save settings","error")}finally{d&&(d.disabled=!1,d.textContent="💾 Save Settings")}}function j(a){document.querySelectorAll(".tab-btn").forEach(a=>{a.classList.remove("active")}),a.target.classList.add("active"),b=a.target.dataset.type,r()}async function k(){if(!a)return;try{const b=document.getElementById("exportLevelingData");b&&(b.disabled=!0,b.textContent="Exporting...");const c=await fetch("/api/plugins/leveling/export/"+a);if(!c.ok)throw new Error("Failed to export data");const d=await c.blob(),e=window.URL.createObjectURL(d),f=document.createElement("a");f.href=e,f.download="leveling-data-"+a+"-"+Date.now()+".json",document.body.appendChild(f),f.click(),document.body.removeChild(f),window.URL.revokeObjectURL(e),x("Data exported successfully!","success")}catch(a){console.error("Error exporting data:",a),x("Failed to export data","error")}finally{const a=document.getElementById("exportLevelingData");a&&(a.disabled=!1,a.textContent="📤 Export Data")}}function l(){confirm("Are you sure you want to reset all settings to defaults?")&&(document.getElementById("xpSourceMessages").checked=!0,document.getElementById("xpSourceVoice").checked=!0,document.getElementById("xpSourceReactions").checked=!0,document.getElementById("xpMultiplier").value=1,document.getElementById("levelUpChannel").value="",document.getElementById("levelUpMessage").value="🎉 {user} reached level {level}!",x("Settings reset to defaults. Remember to save!","info"))}async function m(b){const c=b.target.dataset.action,d=document.getElementById("adminUserId").value.trim(),e=parseInt(document.getElementById("adminXpAmount").value);if(!d||!e||e<1)return void x("Please enter a valid User ID and XP amount","error");if(!a)return void x("Please select a server first","error");const f=b.target,g=f.textContent;f.disabled=!0,f.textContent="Processing...";try{const b=await fetch("/api/plugins/leveling/manage-xp/"+a,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({userId:d,amount:e,action:c})}),g=await b.json();if(!b.ok)throw new Error(g.error||"Failed to manage XP");x(g.message,"success"),document.getElementById("adminUserId").value="",document.getElementById("adminXpAmount").value="",await Promise.all([p(),r()])}catch(a){console.error("Error managing XP:",a),x(a.message||"Failed to manage XP","error")}finally{f.disabled=!1,f.textContent=g}}async function n(){a&&await p()}function x(a,b){window.dashboardAPI&&window.dashboardAPI.showNotification?window.dashboardAPI.showNotification(a,b):console.log("["+b.toUpperCase()+"] "+a)}setTimeout(e,200)})();`
+            html: `
+                <div class="plugin-container">
+                    <div class="page-header">
+                        <div>
+                            <h1 class="page-title">Leveling System</h1>
+                            <p class="page-subtitle">Configure XP sources, view leaderboards, and manage user levels</p>
+                        </div>
+                        <div class="btn-group">
+                            <button id="exportLevelingData" class="btn btn-secondary">
+                                <span class="btn-icon">📤</span>
+                                Export Data
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Statistics Cards -->
+                    <div class="stats-section">
+                        <div class="stats-grid" id="levelingStatsGrid">
+                            <div class="stat-card">
+                                <div class="stat-icon" style="background: linear-gradient(135deg, #4f46e5, #7c3aed);">📊</div>
+                                <div class="stat-content">
+                                    <div class="stat-value" id="activeUsersCount">0</div>
+                                    <div class="stat-label">Active Users</div>
+                                </div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-icon" style="background: linear-gradient(135deg, #059669, #0d9488);">🎯</div>
+                                <div class="stat-content">
+                                    <div class="stat-value" id="totalXpGiven">0</div>
+                                    <div class="stat-label">Total XP Given</div>
+                                </div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-icon" style="background: linear-gradient(135deg, #dc2626, #ea580c);">⭐</div>
+                                <div class="stat-content">
+                                    <div class="stat-value" id="averageLevel">0</div>
+                                    <div class="stat-label">Average Level</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Settings Widget -->
+                    <div class="widget">
+                        <div class="widget-header">
+                            <h3>⚙️ Leveling Settings</h3>
+                            <div class="widget-controls">
+                                <span id="levelingStatus" class="status-badge status-inactive">Disabled</span>
+                            </div>
+                        </div>
+                        <div class="widget-content">
+                            <form id="levelingSettingsForm">
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>XP Sources</label>
+                                        <div class="checkbox-group">
+                                            <div class="checkbox-group-item">
+                                                <input type="checkbox" id="xpSourceMessages" name="xpSources.messages">
+                                                <label for="xpSourceMessages" class="checkbox-label">💬 Messages (10-25 XP)</label>
+                                            </div>
+                                            <div class="checkbox-group-item">
+                                                <input type="checkbox" id="xpSourceVoice" name="xpSources.voice">
+                                                <label for="xpSourceVoice" class="checkbox-label">🎤 Voice Activity (1 XP/min)</label>
+                                            </div>
+                                            <div class="checkbox-group-item">
+                                                <input type="checkbox" id="xpSourceReactions" name="xpSources.reactions">
+                                                <label for="xpSourceReactions" class="checkbox-label">⭐ Reactions (5 XP given, 2 XP received)</label>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="xpMultiplier">XP Multiplier</label>
+                                        <input type="number" id="xpMultiplier" name="xpMultiplier" class="form-control" min="0.1" max="10" step="0.1" value="1">
+                                        <small class="form-text">Multiply all XP gains by this amount</small>
+                                    </div>
+                                </div>
+
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label for="levelUpChannel">Level Up Channel</label>
+                                        <select id="levelUpChannel" name="levelUpChannel" class="form-control">
+                                            <option value="">No notifications</option>
+                                        </select>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="levelUpMessage">Level Up Message</label>
+                                        <input type="text" id="levelUpMessage" name="levelUpMessage" class="form-control" placeholder="🎉 {user} reached level {level}!">
+                                        <small class="form-text">Use {user} and {level} placeholders</small>
+                                    </div>
+                                </div>
+
+                                <div class="btn-group">
+                                    <button type="submit" id="saveLevelingSettings" class="btn btn-primary">
+                                        <span class="btn-icon">💾</span>
+                                        Save Settings
+                                    </button>
+                                    <button type="button" id="resetLevelingSettings" class="btn btn-secondary">
+                                        <span class="btn-icon">🔄</span>
+                                        Reset to Defaults
+                                    </button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+
+                    <!-- XP Management Section -->
+                    <div class="widget">
+                        <div class="widget-header">
+                            <h3>🛠️ XP Management</h3>
+                        </div>
+                        <div class="widget-content" id="xpAdminSection">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="adminUserId">User ID</label>
+                                    <input type="text" id="adminUserId" class="form-control" placeholder="Enter Discord User ID">
+                                </div>
+                                <div class="form-group">
+                                    <label for="adminXpAmount">XP Amount</label>
+                                    <input type="number" id="adminXpAmount" class="form-control" min="1" placeholder="Enter XP amount">
+                                </div>
+                            </div>
+                            <div class="btn-group">
+                                <button id="addXpBtn" class="btn btn-success">
+                                    <span class="btn-icon">➕</span>
+                                    Add XP
+                                </button>
+                                <button id="removeXpBtn" class="btn btn-warning">
+                                    <span class="btn-icon">➖</span>
+                                    Remove XP
+                                </button>
+                                <button id="setXpBtn" class="btn btn-info">
+                                    <span class="btn-icon">🎯</span>
+                                    Set XP
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Leaderboards Section -->
+                    <div class="widget">
+                        <div class="widget-header">
+                            <h3>🏆 Leaderboards</h3>
+                            <div class="leaderboard-tabs">
+                                <button class="tab-btn active" data-type="overall">Overall XP</button>
+                                <button class="tab-btn" data-type="voice">Voice Activity</button>
+                                <button class="tab-btn" data-type="reactions">Reactions</button>
+                            </div>
+                        </div>
+                        <div class="widget-content">
+                            <div id="leaderboardContent">
+                                <div id="leaderboardLoading" class="plugin-loading" style="display: none;">
+                                    Loading leaderboard...
+                                </div>
+                                <div id="leaderboardList" class="leaderboard-list">
+                                    <div class="empty-state">
+                                        <div class="empty-icon">📊</div>
+                                        <div class="empty-text">No leveling data available</div>
+                                        <div class="empty-subtext">Users will appear here as they gain XP</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `,
+            script: `
+                (function() {
+                    console.log("⚡ Leveling Plugin: Initializing frontend component...");
+                    
+                    // Plugin state
+                    let currentServerId = null;
+                    let currentLeaderboardType = 'overall';
+                    let settings = {};
+                    
+                    // Utility functions for safe DOM operations
+                    function safeGetElement(selector) {
+                        const element = document.querySelector(selector);
+                        if (!element) {
+                            console.warn(\`⚠️ Element not found: \${selector}\`);
+                        }
+                        return element;
+                    }
+                    
+                    function safeGetElements(selector) {
+                        const elements = document.querySelectorAll(selector);
+                        if (elements.length === 0) {
+                            console.warn(\`⚠️ No elements found: \${selector}\`);
+                        }
+                        return elements;
+                    }
+                    
+                    function safeAddClass(element, className) {
+                        if (element && element.classList) {
+                            element.classList.add(className);
+                        }
+                    }
+                    
+                    function safeRemoveClass(element, className) {
+                        if (element && element.classList) {
+                            element.classList.remove(className);
+                        }
+                    }
+                    
+                    // DOM elements
+                    let serverSelect = null;
+                    let levelingSettingsForm = null;
+                    let leaderboardTabs = null;
+                    let leaderboardContent = null;
+                    let leaderboardLoading = null;
+                    let leaderboardList = null;
+                    let exportButton = null;
+                    let resetButton = null;
+                    
+                    // XP management elements
+                    let addXpBtn = null;
+                    let removeXpBtn = null;
+                    let setXpBtn = null;
+                    let adminUserId = null;
+                    let adminXpAmount = null;
+
+                    // Initialize plugin
+                    function init() {
+                        if (document.readyState === 'loading') {
+                            document.addEventListener('DOMContentLoaded', initializeElements);
+                        } else {
+                            initializeElements();
+                        }
+                    }
+                    
+                    function initializeElements() {
+                        console.log("🔄 Leveling Plugin: Initializing elements...");
+                        
+                        // Get DOM elements safely
+                        serverSelect = window.serverSelect || safeGetElement('#serverSelect, #ccServerSelect');
+                        levelingSettingsForm = safeGetElement('#levelingSettingsForm');
+                        leaderboardTabs = safeGetElements('.tab-btn');
+                        leaderboardContent = safeGetElement('#leaderboardContent');
+                        leaderboardLoading = safeGetElement('#leaderboardLoading');
+                        leaderboardList = safeGetElement('#leaderboardList');
+                        exportButton = safeGetElement('#exportLevelingData');
+                        resetButton = safeGetElement('#resetLevelingSettings');
+                        
+                        // XP management buttons
+                        addXpBtn = safeGetElement('#addXpBtn');
+                        removeXpBtn = safeGetElement('#removeXpBtn');
+                        setXpBtn = safeGetElement('#setXpBtn');
+                        adminUserId = safeGetElement('#adminUserId');
+                        adminXpAmount = safeGetElement('#adminXpAmount');
+                        
+                        setupEventListeners();
+                        loadInitialData();
+                    }
+
+                    function setupEventListeners() {
+                        console.log("🔄 Leveling Plugin: Setting up event listeners...");
+                        
+                        // Server selection
+                        if (serverSelect) {
+                            serverSelect.addEventListener('change', handleServerChange);
+                        }
+
+                        // Form submission
+                        if (levelingSettingsForm) {
+                            levelingSettingsForm.addEventListener('submit', handleSettingsSubmit);
+                        }
+
+                        // Leaderboard tabs
+                        leaderboardTabs.forEach(tab => {
+                            if (tab) {
+                                tab.addEventListener('click', (e) => {
+                                    const tabType = tab.getAttribute('data-tab') || tab.getAttribute('data-type');
+                                    if (tabType) {
+                                        switchLeaderboardTab(tabType);
+                                    }
+                                });
+                            }
+                        });
+
+                        // Export button
+                        if (exportButton) {
+                            exportButton.addEventListener('click', handleExportData);
+                        }
+
+                        // Reset button
+                        if (resetButton) {
+                            resetButton.addEventListener('click', handleResetSettings);
+                        }
+
+                        // XP management buttons
+                        if (addXpBtn) {
+                            addXpBtn.addEventListener('click', () => handleXpAction('add'));
+                        }
+                        if (removeXpBtn) {
+                            removeXpBtn.addEventListener('click', () => handleXpAction('remove'));
+                        }
+                        if (setXpBtn) {
+                            setXpBtn.addEventListener('click', () => handleXpAction('set'));
+                        }
+                        
+                        console.log("✅ Leveling Plugin: Event listeners setup complete");
+                    }
+
+                    function loadInitialData() {
+                        // Check if we have a current server selected
+                        if (window.currentSelectedServer) {
+                            currentServerId = window.currentSelectedServer;
+                            loadServerData();
+                        } else if (serverSelect && serverSelect.value) {
+                            currentServerId = serverSelect.value;
+                            loadServerData();
+                        }
+                    }
+
+                    function handleServerChange(event) {
+                        const newServerId = event?.target?.value || serverSelect?.value;
+                        if (newServerId && newServerId !== currentServerId) {
+                            currentServerId = newServerId;
+                            loadServerData();
+                        }
+                    }
+
+                    async function loadServerData() {
+                        if (!currentServerId) {
+                            console.log("⚠️ No server selected for leveling plugin");
+                            return;
+                        }
+                        
+                        console.log(\`🔄 Loading leveling data for server: \${currentServerId}\`);
+                        
+                        try {
+                            await Promise.allSettled([
+                                loadSettings(),
+                                loadLeaderboard(),
+                                loadStats(),
+                                loadChannels()
+                            ]);
+                        } catch (error) {
+                            console.error('Error loading server data:', error);
+                            if (window.showNotification) {
+                                window.showNotification('Error loading leveling data', 'error');
+                            }
+                        }
+                    }
+
+                    async function loadSettings() {
+                        try {
+                            const response = await fetch(\`/api/plugins/leveling/settings/\${currentServerId}\`);
+                            if (response.ok) {
+                                settings = await response.json();
+                                updateSettingsForm();
+                                updateStatus();
+                                console.log("✅ Leveling settings loaded");
+                            }
+                        } catch (error) {
+                            console.error('Error loading settings:', error);
+                        }
+                    }
+
+                    async function loadChannels() {
+                        try {
+                            const response = await fetch(\`/api/channels/\${currentServerId}\`);
+                            if (response.ok) {
+                                const channels = await response.json();
+                                updateChannelSelect(channels);
+                            }
+                        } catch (error) {
+                            console.error('Error loading channels:', error);
+                        }
+                    }
+
+                    async function loadLeaderboard() {
+                        if (!leaderboardContent) return;
+                        
+                        try {
+                            // Show loading state
+                            if (leaderboardLoading) {
+                                leaderboardLoading.style.display = 'block';
+                            }
+                            if (leaderboardList) {
+                                leaderboardList.style.display = 'none';
+                            }
+                            
+                            const response = await fetch(\`/api/plugins/leveling/leaderboard/\${currentServerId}?type=\${currentLeaderboardType}&limit=50\`);
+                            
+                            if (response.ok) {
+                                const data = await response.json();
+                                displayLeaderboard(data);
+                                console.log(\`✅ Leaderboard loaded: \${data.length} users\`);
+                            } else {
+                                console.warn('Failed to load leaderboard:', response.status);
+                                displayEmptyLeaderboard();
+                            }
+                        } catch (error) {
+                            console.error('Error loading leaderboard:', error);
+                            displayEmptyLeaderboard();
+                        } finally {
+                            // Hide loading state
+                            if (leaderboardLoading) {
+                                leaderboardLoading.style.display = 'none';
+                            }
+                            if (leaderboardList) {
+                                leaderboardList.style.display = 'block';
+                            }
+                        }
+                    }
+
+                    async function loadStats() {
+                        try {
+                            const response = await fetch(\`/api/plugins/leveling/stats/\${currentServerId}\`);
+                            if (response.ok) {
+                                const stats = await response.json();
+                                updateStatsDisplay(stats);
+                                console.log("✅ Leveling stats loaded");
+                            }
+                        } catch (error) {
+                            console.error('Error loading stats:', error);
+                        }
+                    }
+
+                    function switchLeaderboardTab(tabType) {
+                        console.log(\`🔄 Switching leaderboard tab to: \${tabType}\`);
+                        
+                        // Update tab buttons safely
+                        leaderboardTabs.forEach(tab => {
+                            if (tab) {
+                                safeRemoveClass(tab, 'active');
+                                const tabTypeAttr = tab.getAttribute('data-tab') || tab.getAttribute('data-type');
+                                if (tabTypeAttr === tabType) {
+                                    safeAddClass(tab, 'active');
+                                }
+                            }
+                        });
+
+                        // Update current type and reload
+                        currentLeaderboardType = tabType;
+                        if (currentServerId) {
+                            loadLeaderboard();
+                        }
+                    }
+
+                    function updateSettingsForm() {
+                        if (!levelingSettingsForm || !settings) return;
+                        
+                        // Update form fields based on settings
+                        const xpSourcesMessages = safeGetElement('#xpSourceMessages');
+                        const xpSourcesVoice = safeGetElement('#xpSourceVoice');
+                        const xpSourcesReactions = safeGetElement('#xpSourceReactions');
+                        const xpMultiplier = safeGetElement('#xpMultiplier');
+                        const levelUpChannel = safeGetElement('#levelUpChannel');
+                        const levelUpMessage = safeGetElement('#levelUpMessage');
+                        
+                        if (xpSourcesMessages) {
+                            xpSourcesMessages.checked = settings.xpSources?.messages !== false;
+                        }
+                        if (xpSourcesVoice) {
+                            xpSourcesVoice.checked = settings.xpSources?.voice === true;
+                        }
+                        if (xpSourcesReactions) {
+                            xpSourcesReactions.checked = settings.xpSources?.reactions === true;
+                        }
+                        if (xpMultiplier) {
+                            xpMultiplier.value = settings.xpMultiplier || 1;
+                        }
+                        if (levelUpChannel) {
+                            levelUpChannel.value = settings.levelUpChannel || '';
+                        }
+                        if (levelUpMessage) {
+                            levelUpMessage.value = settings.levelUpMessage || '🎉 {user} reached level {level}!';
+                        }
+                        
+                        console.log("✅ Settings form updated");
+                    }
+
+                    function updateChannelSelect(channels) {
+                        const levelUpChannel = safeGetElement('#levelUpChannel');
+                        if (!levelUpChannel) return;
+                        
+                        levelUpChannel.innerHTML = '<option value="">No notifications</option>';
+                        
+                        channels.forEach(channel => {
+                            if (channel.type === 0) { // Text channels only
+                                const option = document.createElement('option');
+                                option.value = channel.id;
+                                option.textContent = \`#\${channel.name}\`;
+                                levelUpChannel.appendChild(option);
+                            }
+                        });
+                        
+                        // Restore selected value
+                        if (settings.levelUpChannel) {
+                            levelUpChannel.value = settings.levelUpChannel;
+                        }
+                    }
+
+                    function updateStatus() {
+                        const statusElement = safeGetElement('#levelingStatus');
+                        if (statusElement) {
+                            const isEnabled = settings.enabled !== false && (
+                                settings.xpSources?.messages || 
+                                settings.xpSources?.voice || 
+                                settings.xpSources?.reactions
+                            );
+                            statusElement.textContent = isEnabled ? 'Enabled' : 'Disabled';
+                            safeRemoveClass(statusElement, 'status-active');
+                            safeRemoveClass(statusElement, 'status-inactive');
+                            safeAddClass(statusElement, isEnabled ? 'status-active' : 'status-inactive');
+                        }
+                    }
+
+                    function updateStatsDisplay(stats) {
+                        // Update stats cards safely
+                        const activeUsersElement = safeGetElement('#activeUsersCount');
+                        const totalXpElement = safeGetElement('#totalXpGiven');
+                        const avgLevelElement = safeGetElement('#averageLevel');
+                        
+                        if (activeUsersElement) {
+                            activeUsersElement.textContent = stats.activeUsers || '0';
+                        }
+                        if (totalXpElement) {
+                            totalXpElement.textContent = (stats.totalXp || 0).toLocaleString();
+                        }
+                        if (avgLevelElement) {
+                            avgLevelElement.textContent = stats.averageLevel || '0';
+                        }
+                    }
+
+                    function displayLeaderboard(data) {
+                        if (!leaderboardList) return;
+                        
+                        if (!data || data.length === 0) {
+                            displayEmptyLeaderboard();
+                            return;
+                        }
+                        
+                        const leaderboardHTML = data.map((user, index) => {
+                            const rankEmoji = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : \`#\${index + 1}\`;
+                            const progressWidth = user.xp > 0 ? calculateProgress(user.xp) : 0;
+                            
+                            return \`
+                                <div class="leaderboard-item">
+                                    <div class="rank">\${rankEmoji}</div>
+                                    <div class="user-info">
+                                        <img src="\${user.avatar || '/default-avatar.png'}" alt="Avatar" class="user-avatar" loading="lazy">
+                                        <div class="user-details">
+                                            <div class="user-name">\${user.displayName || user.username || 'Unknown User'}</div>
+                                            <div class="user-stats">
+                                                Level \${user.level || 0} • \${(user.xp || 0).toLocaleString()} XP
+                                                \${currentLeaderboardType === 'voice' ? \` • \${Math.floor((user.voiceTime || 0) / 60)}h voice\` : ''}
+                                                \${currentLeaderboardType === 'reactions' ? \` • \${user.reactionsGiven || 0} reactions\` : ''}
+                                            </div>
+                                            <div class="progress-bar">
+                                                <div class="progress-fill" style="width: \${progressWidth}%"></div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="user-actions">
+                                        <button class="action-btn" onclick="editUserXp('\${user.userId}', \${user.xp || 0})">
+                                            ✏️ Edit
+                                        </button>
+                                    </div>
+                                </div>
+                            \`;
+                        }).join('');
+                        
+                        leaderboardList.innerHTML = leaderboardHTML;
+                    }
+
+                    function displayEmptyLeaderboard() {
+                        if (!leaderboardList) return;
+                        
+                        leaderboardList.innerHTML = \`
+                            <div class="empty-state">
+                                <div class="empty-icon">📊</div>
+                                <div class="empty-text">No leveling data available</div>
+                                <div class="empty-subtext">Users will appear here as they gain XP</div>
+                            </div>
+                        \`;
+                    }
+
+                    function calculateProgress(xp) {
+                        const level = Math.floor(Math.sqrt(xp / 100));
+                        const currentLevelXP = level * level * 100;
+                        const nextLevelXP = (level + 1) * (level + 1) * 100;
+                        const progress = xp - currentLevelXP;
+                        const total = nextLevelXP - currentLevelXP;
+                        return Math.floor((progress / total) * 100);
+                    }
+
+                    async function handleSettingsSubmit(event) {
+                        event.preventDefault();
+                        
+                        if (!currentServerId) {
+                            if (window.showNotification) {
+                                window.showNotification('Please select a server first', 'error');
+                            }
+                            return;
+                        }
+                        
+                        const formData = new FormData(levelingSettingsForm);
+                        const newSettings = {
+                            enabled: true,
+                            xpSources: {
+                                messages: formData.has('xpSources.messages'),
+                                voice: formData.has('xpSources.voice'),
+                                reactions: formData.has('xpSources.reactions')
+                            },
+                            xpMultiplier: parseFloat(formData.get('xpMultiplier')) || 1,
+                            levelUpChannel: formData.get('levelUpChannel') || null,
+                            levelUpMessage: formData.get('levelUpMessage') || '🎉 {user} reached level {level}!'
+                        };
+                        
+                        try {
+                            const response = await fetch(\`/api/plugins/leveling/settings/\${currentServerId}\`, {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json'
+                                },
+                                body: JSON.stringify(newSettings)
+                            });
+                            
+                            if (response.ok) {
+                                settings = { ...settings, ...newSettings };
+                                updateStatus();
+                                if (window.showNotification) {
+                                    window.showNotification('Settings saved successfully!', 'success');
+                                }
+                                console.log("✅ Settings saved");
+                            } else {
+                                throw new Error('Failed to save settings');
+                            }
+                        } catch (error) {
+                            console.error('Error saving settings:', error);
+                            if (window.showNotification) {
+                                window.showNotification('Error saving settings', 'error');
+                            }
+                        }
+                    }
+
+                    async function handleXpAction(action) {
+                        const userId = adminUserId?.value?.trim();
+                        const amount = parseInt(adminXpAmount?.value) || 0;
+                        
+                        if (!userId || amount <= 0) {
+                            if (window.showNotification) {
+                                window.showNotification('Please enter a valid user ID and amount', 'error');
+                            }
+                            return;
+                        }
+                        
+                        if (!currentServerId) {
+                            if (window.showNotification) {
+                                window.showNotification('Please select a server first', 'error');
+                            }
+                            return;
+                        }
+                        
+                        try {
+                            const response = await fetch(\`/api/plugins/leveling/admin/\${action}\`, {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json'
+                                },
+                                body: JSON.stringify({
+                                    userId,
+                                    guildId: currentServerId,
+                                    amount
+                                })
+                            });
+                            
+                            if (response.ok) {
+                                const result = await response.json();
+                                if (window.showNotification) {
+                                    window.showNotification(
+                                        \`Successfully \${action === 'set' ? 'set' : action + 'ed'} XP! New: \${result.newXP} XP (Level \${result.newLevel})\`, 
+                                        'success'
+                                    );
+                                }
+                                // Clear form
+                                if (adminUserId) adminUserId.value = '';
+                                if (adminXpAmount) adminXpAmount.value = '';
+                                // Reload leaderboard and stats
+                                loadLeaderboard();
+                                loadStats();
+                            } else {
+                                throw new Error(\`Failed to \${action} XP\`);
+                            }
+                        } catch (error) {
+                            console.error(\`Error \${action}ing XP:\`, error);
+                            if (window.showNotification) {
+                                window.showNotification(\`Error \${action}ing XP\`, 'error');
+                            }
+                        }
+                    }
+
+                    async function handleExportData() {
+                        if (!currentServerId) {
+                            if (window.showNotification) {
+                                window.showNotification('Please select a server first', 'error');
+                            }
+                            return;
+                        }
+                        
+                        try {
+                            const response = await fetch(\`/api/plugins/leveling/export/\${currentServerId}\`);
+                            if (response.ok) {
+                                const blob = await response.blob();
+                                const url = window.URL.createObjectURL(blob);
+                                const a = document.createElement('a');
+                                a.href = url;
+                                a.download = \`leveling-data-\${currentServerId}-\${new Date().toISOString().split('T')[0]}.json\`;
+                                document.body.appendChild(a);
+                                a.click();
+                                document.body.removeChild(a);
+                                window.URL.revokeObjectURL(url);
+                                
+                                if (window.showNotification) {
+                                    window.showNotification('Data exported successfully!', 'success');
+                                }
+                            } else {
+                                throw new Error('Export failed');
+                            }
+                        } catch (error) {
+                            console.error('Error exporting data:', error);
+                            if (window.showNotification) {
+                                window.showNotification('Error exporting data', 'error');
+                            }
+                        }
+                    }
+
+                    async function handleResetSettings() {
+                        if (!confirm('Are you sure you want to reset all leveling settings? This cannot be undone.')) {
+                            return;
+                        }
+                        
+                        if (!currentServerId) {
+                            if (window.showNotification) {
+                                window.showNotification('Please select a server first', 'error');
+                            }
+                            return;
+                        }
+                        
+                        try {
+                            const response = await fetch(\`/api/plugins/leveling/reset/\${currentServerId}\`, {
+                                method: 'POST'
+                            });
+                            
+                            if (response.ok) {
+                                settings = {};
+                                updateSettingsForm();
+                                updateStatus();
+                                loadLeaderboard();
+                                loadStats();
+                                
+                                if (window.showNotification) {
+                                    window.showNotification('Settings reset successfully!', 'success');
+                                }
+                            } else {
+                                throw new Error('Reset failed');
+                            }
+                        } catch (error) {
+                            console.error('Error resetting settings:', error);
+                            if (window.showNotification) {
+                                window.showNotification('Error resetting settings', 'error');
+                            }
+                        }
+                    }
+
+                    // Global function for editing user XP (called from leaderboard)
+                    window.editUserXp = function(userId, currentXp) {
+                        if (adminUserId) {
+                            adminUserId.value = userId;
+                        }
+                        if (adminXpAmount) {
+                            adminXpAmount.value = currentXp;
+                        }
+                        
+                        // Scroll to admin section
+                        const adminSection = safeGetElement('#xpAdminSection');
+                        if (adminSection) {
+                            adminSection.scrollIntoView({ behavior: 'smooth' });
+                        }
+                    };
+
+                    // Handle server changes from global context
+                    window.addEventListener('serverChanged', function(event) {
+                        if (event.detail && event.detail.serverId) {
+                            currentServerId = event.detail.serverId;
+                            loadServerData();
+                        }
+                    });
+
+                    // Listen for global server selection changes
+                    if (window.currentSelectedServer) {
+                        currentServerId = window.currentSelectedServer;
+                    }
+
+                    // Initialize when script loads
+                    init();
+                    
+                    console.log("✅ Leveling Plugin: Frontend component initialized successfully");
+                })();
+            `
         };
     }
 }
