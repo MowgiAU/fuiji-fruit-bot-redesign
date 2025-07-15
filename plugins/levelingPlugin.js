@@ -24,14 +24,12 @@ class LevelingPlugin {
 
     async initializeData() {
         try {
-            // Initialize leveling data file
             try {
                 await fs.access(this.dataPath);
             } catch {
                 await fs.writeFile(this.dataPath, JSON.stringify({ users: {} }, null, 2));
             }
 
-            // Initialize settings file
             try {
                 await fs.access(this.settingsPath);
             } catch {
@@ -43,7 +41,7 @@ class LevelingPlugin {
     }
 
     setupRoutes() {
-        // Get leveling statistics for dashboard
+        // Get leveling statistics
         this.app.get('/api/plugins/leveling/stats/:guildId', this.ensureAuthenticated, async (req, res) => {
             try {
                 const { guildId } = req.params;
@@ -55,7 +53,6 @@ class LevelingPlugin {
                 const data = await this.loadData();
                 const settings = await this.loadSettings();
                 
-                // Calculate server statistics
                 const serverUsers = Object.keys(data.users).filter(userId => 
                     data.users[userId][guildId]
                 ).length;
@@ -145,7 +142,6 @@ class LevelingPlugin {
 
                 const leaderboard = await this.generateLeaderboard(guildId, type, parseInt(limit));
                 
-                // Enrich with user data
                 const enrichedLeaderboard = await Promise.all(
                     leaderboard.map(async (entry, index) => {
                         try {
@@ -186,7 +182,7 @@ class LevelingPlugin {
         this.app.post('/api/plugins/leveling/manage-xp/:guildId', this.ensureAuthenticated, async (req, res) => {
             try {
                 const { guildId } = req.params;
-                const { userId, amount, action } = req.body; // action: 'add', 'remove', 'set'
+                const { userId, amount, action } = req.body;
                 
                 if (!await this.hasAdminPermissions(req.user.id, guildId)) {
                     return res.status(403).json({ error: 'Insufficient permissions' });
@@ -222,7 +218,6 @@ class LevelingPlugin {
                         return res.status(400).json({ error: 'Invalid action' });
                 }
 
-                // Recalculate level
                 userData.level = this.calculateLevel(userData.xp);
                 
                 await fs.writeFile(this.dataPath, JSON.stringify(data, null, 2));
@@ -297,20 +292,18 @@ class LevelingPlugin {
             
             if (!guildSettings?.xpSources?.voice) return;
             
-            // User joined voice
             if (!oldState.channelId && newState.channelId) {
                 this.voiceSessions = this.voiceSessions || {};
                 this.voiceSessions[`${guildId}-${newState.id}`] = Date.now();
             }
             
-            // User left voice
             if (oldState.channelId && !newState.channelId) {
                 const sessionKey = `${guildId}-${newState.id}`;
                 if (this.voiceSessions?.[sessionKey]) {
-                    const sessionTime = Math.floor((Date.now() - this.voiceSessions[sessionKey]) / 60000); // minutes
+                    const sessionTime = Math.floor((Date.now() - this.voiceSessions[sessionKey]) / 60000);
                     delete this.voiceSessions[sessionKey];
                     
-                    if (sessionTime >= 1) { // Minimum 1 minute
+                    if (sessionTime >= 1) {
                         await this.addVoiceTime(newState.id, guildId, sessionTime, guildSettings);
                     }
                 }
@@ -330,7 +323,7 @@ class LevelingPlugin {
             await this.addReaction(reaction.message.author.id, reaction.message.guild.id, 'received', guildSettings);
         });
 
-        // Slash command handling
+        // Slash commands
         this.client.on('interactionCreate', async (interaction) => {
             if (!interaction.isChatInputCommand()) return;
 
@@ -357,7 +350,6 @@ class LevelingPlugin {
     }
 
     async registerSlashCommands() {
-        // Wait for client to be ready before registering commands
         if (!this.client.isReady()) {
             this.client.once('ready', () => {
                 this.registerSlashCommands();
@@ -372,7 +364,7 @@ class LevelingPlugin {
                 options: [{
                     name: 'user',
                     description: 'The user to check (defaults to yourself)',
-                    type: 6, // USER
+                    type: 6,
                     required: false
                 }]
             },
@@ -383,7 +375,7 @@ class LevelingPlugin {
                     {
                         name: 'type',
                         description: 'Type of leaderboard',
-                        type: 3, // STRING
+                        type: 3,
                         required: false,
                         choices: [
                             { name: 'Overall XP', value: 'overall' },
@@ -394,7 +386,7 @@ class LevelingPlugin {
                     {
                         name: 'limit',
                         description: 'Number of users to show (1-25)',
-                        type: 4, // INTEGER
+                        type: 4,
                         required: false,
                         min_value: 1,
                         max_value: 25
@@ -411,7 +403,6 @@ class LevelingPlugin {
         }
     }
 
-    // Helper methods
     getDefaultSettings() {
         return {
             xpSources: {
@@ -495,7 +486,6 @@ class LevelingPlugin {
         userData.xp += xpGain;
         userData.level = this.calculateLevel(userData.xp);
 
-        // Level up notification
         if (userData.level > oldLevel && guildSettings.levelUpChannel) {
             try {
                 const channel = await this.client.channels.fetch(guildSettings.levelUpChannel);
@@ -526,7 +516,6 @@ class LevelingPlugin {
         const userData = data.users[userId][guildId];
         userData.voiceTime += minutes;
         
-        // Add XP for voice time (1 XP per minute)
         const xpGain = Math.floor(minutes * (guildSettings.xpMultiplier || 1));
         userData.xp += xpGain;
         userData.level = this.calculateLevel(userData.xp);
@@ -553,7 +542,6 @@ class LevelingPlugin {
             userData.reactionsReceived++;
         }
         
-        // Add XP for reactions (2 XP per reaction)
         const xpGain = Math.floor(2 * (guildSettings.xpMultiplier || 1));
         userData.xp += xpGain;
         userData.level = this.calculateLevel(userData.xp);
@@ -607,7 +595,6 @@ class LevelingPlugin {
                 return await interaction.editReply('This command can only be used in a server!');
             }
 
-            // Check if leveling is enabled for this server
             const settings = await this.loadSettings();
             const guildSettings = settings[guildId];
             
@@ -727,615 +714,13 @@ class LevelingPlugin {
 
     getFrontendComponent() {
         return {
-            id: 'leveling-system',
+            id: 'leveling',
             name: 'Leveling System',
             description: 'XP and leveling system with multiple sources and leaderboards',
             icon: '📈',
             containerId: 'levelingPluginContainer',
-            html: `
-                <div class="plugin-container">
-                    <div class="page-header">
-                        <div>
-                            <h1 class="page-title">Leveling System</h1>
-                            <p class="page-subtitle">Configure XP sources, view leaderboards, and manage user levels</p>
-                        </div>
-                        <div class="btn-group">
-                            <button id="exportLevelingData" class="btn btn-secondary">
-                                <span class="btn-icon">📤</span>
-                                Export Data
-                            </button>
-                        </div>
-                    </div>
-
-                    <!-- Statistics Cards -->
-                    <div class="stats-section">
-                        <div class="stats-grid" id="levelingStatsGrid">
-                            <div class="stat-card">
-                                <div class="stat-icon" style="background: linear-gradient(135deg, #4f46e5, #7c3aed);">📊</div>
-                                <div class="stat-content">
-                                    <div class="stat-value" id="activeUsersCount">0</div>
-                                    <div class="stat-label">Active Users</div>
-                                </div>
-                            </div>
-                            <div class="stat-card">
-                                <div class="stat-icon" style="background: linear-gradient(135deg, #22c55e, #16a34a);">⭐</div>
-                                <div class="stat-content">
-                                    <div class="stat-value" id="totalXPCount">0</div>
-                                    <div class="stat-label">Total XP</div>
-                                </div>
-                            </div>
-                            <div class="stat-card">
-                                <div class="stat-icon" style="background: linear-gradient(135deg, #f59e0b, #d97706);">🎯</div>
-                                <div class="stat-content">
-                                    <div class="stat-value" id="maxLevelCount">0</div>
-                                    <div class="stat-label">Highest Level</div>
-                                </div>
-                            </div>
-                            <div class="stat-card">
-                                <div class="stat-icon" style="background: linear-gradient(135deg, #ef4444, #dc2626);">🎤</div>
-                                <div class="stat-content">
-                                    <div class="stat-value" id="voiceTimeCount">0</div>
-                                    <div class="stat-label">Voice Minutes</div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Settings Section -->
-                    <div class="widget">
-                        <div class="widget-header">
-                            <h3>⚙️ Leveling Settings</h3>
-                            <div class="widget-controls">
-                                <span id="levelingStatus" class="status-badge status-inactive">Disabled</span>
-                            </div>
-                        </div>
-                        <div class="widget-content">
-                            <form id="levelingSettingsForm">
-                                <div class="form-row">
-                                    <div class="form-group">
-                                        <label>XP Sources</label>
-                                        <div class="checkbox-group">
-                                            <div class="checkbox-group-item">
-                                                <input type="checkbox" id="xpSourceMessages" name="xpSources.messages">
-                                                <label for="xpSourceMessages" class="checkbox-label">💬 Messages (10-25 XP)</label>
-                                            </div>
-                                            <div class="checkbox-group-item">
-                                                <input type="checkbox" id="xpSourceVoice" name="xpSources.voice">
-                                                <label for="xpSourceVoice" class="checkbox-label">🎤 Voice Activity (1 XP/min)</label>
-                                            </div>
-                                            <div class="checkbox-group-item">
-                                                <input type="checkbox" id="xpSourceReactions" name="xpSources.reactions">
-                                                <label for="xpSourceReactions" class="checkbox-label">😄 Reactions (2 XP each)</label>
-                                            </div>
-                                        </div>
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="xpMultiplier">XP Multiplier</label>
-                                        <input type="number" id="xpMultiplier" name="xpMultiplier" class="form-control" 
-                                               min="0.1" max="10" step="0.1" value="1.0">
-                                        <small style="color: var(--text-muted); font-size: 12px;">Multiply all XP gains (0.1x to 10x)</small>
-                                    </div>
-                                </div>
-                                
-                                <div class="form-row">
-                                    <div class="form-group">
-                                        <label for="levelUpChannel">Level Up Channel</label>
-                                        <select id="levelUpChannel" name="levelUpChannel" class="form-control">
-                                            <option value="">Select a channel...</option>
-                                        </select>
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="levelUpMessage">Level Up Message</label>
-                                        <input type="text" id="levelUpMessage" name="levelUpMessage" class="form-control" 
-                                               placeholder="🎉 {user} reached level {level}!" 
-                                               value="🎉 {user} reached level {level}!">
-                                        <small style="color: var(--text-muted); font-size: 12px;">Use {user} and {level} placeholders</small>
-                                    </div>
-                                </div>
-
-                                <div class="btn-group">
-                                    <button type="submit" id="saveLevelingSettings" class="btn btn-primary">
-                                        <span class="btn-icon">💾</span>
-                                        Save Settings
-                                    </button>
-                                    <button type="button" id="resetLevelingSettings" class="btn btn-secondary">
-                                        <span class="btn-icon">🔄</span>
-                                        Reset to Defaults
-                                    </button>
-                                </div>
-                            </form>
-                        </div>
-                    </div>
-
-                    <!-- Leaderboards Section -->
-                    <div class="widget">
-                        <div class="widget-header">
-                            <h3>🏆 Leaderboards</h3>
-                            <div class="leaderboard-tabs">
-                                <button class="tab-btn active" data-type="overall">Overall XP</button>
-                                <button class="tab-btn" data-type="voice">Voice Activity</button>
-                                <button class="tab-btn" data-type="reactions">Reactions</button>
-                            </div>
-                        </div>
-                        <div class="widget-content">
-                            <div id="leaderboardContent">
-                                <div id="leaderboardLoading" class="plugin-loading" style="display: none;">
-                                    Loading leaderboard...
-                                </div>
-                                <div id="leaderboardList" class="leaderboard-list"></div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Admin Management Section -->
-                    <div class="widget">
-                        <div class="widget-header">
-                            <h3>👑 Admin Management</h3>
-                        </div>
-                        <div class="widget-content">
-                            <div class="form-row">
-                                <div class="form-group">
-                                    <label for="adminUserId">User ID</label>
-                                    <input type="text" id="adminUserId" class="form-control" 
-                                           placeholder="Enter Discord User ID">
-                                </div>
-                                <div class="form-group">
-                                    <label for="adminXpAmount">XP Amount</label>
-                                    <input type="number" id="adminXpAmount" class="form-control" 
-                                           placeholder="Enter XP amount" min="1">
-                                </div>
-                            </div>
-
-                            <div class="btn-group">
-                                <button id="addXpBtn" class="btn btn-success" data-action="add">
-                                    <span class="btn-icon">➕</span>
-                                    Add XP
-                                </button>
-                                <button id="removeXpBtn" class="btn btn-warning" data-action="remove">
-                                    <span class="btn-icon">➖</span>
-                                    Remove XP
-                                </button>
-                                <button id="setXpBtn" class="btn btn-danger" data-action="set">
-                                    <span class="btn-icon">🎯</span>
-                                    Set XP
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            `,
-            script: `
-                (function() {
-                    // Plugin state
-                    let currentServerId = null;
-                    let currentLeaderboardType = 'overall';
-                    let settings = {};
-                    
-                    // DOM elements
-                    const serverSelect = window.serverSelect;
-                    const levelingSettingsForm = document.getElementById('levelingSettingsForm');
-                    const leaderboardTabs = document.querySelectorAll('.tab-btn');
-                    const leaderboardContent = document.getElementById('leaderboardContent');
-                    const leaderboardLoading = document.getElementById('leaderboardLoading');
-                    const leaderboardList = document.getElementById('leaderboardList');
-                    const exportButton = document.getElementById('exportLevelingData');
-                    const resetButton = document.getElementById('resetLevelingSettings');
-                    
-                    // XP management buttons
-                    const addXpBtn = document.getElementById('addXpBtn');
-                    const removeXpBtn = document.getElementById('removeXpBtn');
-                    const setXpBtn = document.getElementById('setXpBtn');
-                    const adminUserId = document.getElementById('adminUserId');
-                    const adminXpAmount = document.getElementById('adminXpAmount');
-
-                    // Initialize plugin
-                    function init() {
-                        setupEventListeners();
-                        loadInitialData();
-                    }
-
-                    function setupEventListeners() {
-                        // Server selection
-                        if (serverSelect) {
-                            serverSelect.addEventListener('change', handleServerChange);
-                        }
-
-                        // Settings form
-                        if (levelingSettingsForm) {
-                            levelingSettingsForm.addEventListener('submit', handleSettingsSave);
-                        }
-
-                        // Leaderboard tabs
-                        leaderboardTabs.forEach(tab => {
-                            tab.addEventListener('click', handleLeaderboardTabChange);
-                        });
-
-                        // Export button
-                        if (exportButton) {
-                            exportButton.addEventListener('click', handleExportData);
-                        }
-
-                        // Reset button
-                        if (resetButton) {
-                            resetButton.addEventListener('click', handleResetSettings);
-                        }
-
-                        // XP management buttons
-                        [addXpBtn, removeXpBtn, setXpBtn].forEach(btn => {
-                            if (btn) {
-                                btn.addEventListener('click', handleXpManagement);
-                            }
-                        });
-
-                        // Real-time updates
-                        setInterval(updateStats, 30000); // Update stats every 30 seconds
-                    }
-
-                    async function loadInitialData() {
-                        currentServerId = serverSelect?.value;
-                        if (!currentServerId) return;
-
-                        await Promise.all([
-                            loadSettings(),
-                            loadStats(),
-                            loadChannels(),
-                            loadLeaderboard()
-                        ]);
-                    }
-
-                    async function handleServerChange() {
-                        currentServerId = serverSelect.value;
-                        if (!currentServerId) return;
-
-                        showNotification('Loading server data...', 'info');
-                        await loadInitialData();
-                    }
-
-                    async function loadSettings() {
-                        if (!currentServerId) return;
-
-                        try {
-                            const response = await fetch(\`/api/plugins/leveling/settings/\${currentServerId}\`);
-                            if (!response.ok) throw new Error('Failed to load settings');
-
-                            settings = await response.json();
-                            populateSettingsForm();
-                            updateStatusBadge();
-                        } catch (error) {
-                            console.error('Error loading settings:', error);
-                            showNotification('Failed to load settings', 'error');
-                        }
-                    }
-
-                    async function loadStats() {
-                        if (!currentServerId) return;
-
-                        try {
-                            const response = await fetch(\`/api/plugins/leveling/stats/\${currentServerId}\`);
-                            if (!response.ok) throw new Error('Failed to load stats');
-
-                            const stats = await response.json();
-                            updateStatsDisplay(stats);
-                        } catch (error) {
-                            console.error('Error loading stats:', error);
-                        }
-                    }
-
-                    async function loadChannels() {
-                        if (!currentServerId) return;
-
-                        try {
-                            const response = await fetch(\`/api/channels/\${currentServerId}\`);
-                            if (!response.ok) throw new Error('Failed to load channels');
-
-                            const channels = await response.json();
-                            populateChannelSelect(channels);
-                        } catch (error) {
-                            console.error('Error loading channels:', error);
-                        }
-                    }
-
-                    async function loadLeaderboard() {
-                        if (!currentServerId) return;
-
-                        leaderboardLoading.style.display = 'block';
-                        leaderboardList.innerHTML = '';
-
-                        try {
-                            const response = await fetch(\`/api/plugins/leveling/leaderboard/\${currentServerId}?type=\${currentLeaderboardType}&limit=10\`);
-                            if (!response.ok) throw new Error('Failed to load leaderboard');
-
-                            const leaderboard = await response.json();
-                            displayLeaderboard(leaderboard);
-                        } catch (error) {
-                            console.error('Error loading leaderboard:', error);
-                            leaderboardList.innerHTML = '<div class="empty-state">Failed to load leaderboard</div>';
-                        } finally {
-                            leaderboardLoading.style.display = 'none';
-                        }
-                    }
-
-                    function populateSettingsForm() {
-                        // XP Sources
-                        document.getElementById('xpSourceMessages').checked = settings.xpSources?.messages || false;
-                        document.getElementById('xpSourceVoice').checked = settings.xpSources?.voice || false;
-                        document.getElementById('xpSourceReactions').checked = settings.xpSources?.reactions || false;
-
-                        // XP Multiplier
-                        document.getElementById('xpMultiplier').value = settings.xpMultiplier || 1.0;
-
-                        // Level up channel
-                        document.getElementById('levelUpChannel').value = settings.levelUpChannel || '';
-
-                        // Level up message
-                        document.getElementById('levelUpMessage').value = settings.levelUpMessage || '🎉 {user} reached level {level}!';
-                    }
-
-                    function populateChannelSelect(channels) {
-                        const channelSelect = document.getElementById('levelUpChannel');
-                        if (!channelSelect) return;
-
-                        channelSelect.innerHTML = '<option value="">Select a channel...</option>';
-                        
-                        channels.forEach(channel => {
-                            if (channel.type === 0) { // Text channels only
-                                const option = document.createElement('option');
-                                option.value = channel.id;
-                                option.textContent = \`#\${channel.name}\`;
-                                channelSelect.appendChild(option);
-                            }
-                        });
-
-                        // Set current value
-                        if (settings.levelUpChannel) {
-                            channelSelect.value = settings.levelUpChannel;
-                        }
-                    }
-
-                    function updateStatsDisplay(stats) {
-                        document.getElementById('activeUsersCount').textContent = stats.serverUsers.toLocaleString();
-                        document.getElementById('totalXPCount').textContent = stats.totalXP.toLocaleString();
-                        document.getElementById('maxLevelCount').textContent = stats.maxLevel;
-                        document.getElementById('voiceTimeCount').textContent = Math.floor(stats.totalVoiceTime).toLocaleString();
-                    }
-
-                    function updateStatusBadge() {
-                        const statusBadge = document.getElementById('levelingStatus');
-                        if (!statusBadge) return;
-
-                        const isEnabled = settings.xpSources?.messages || settings.xpSources?.voice || settings.xpSources?.reactions;
-                        
-                        if (isEnabled) {
-                            statusBadge.textContent = 'Active';
-                            statusBadge.className = 'status-badge status-active';
-                        } else {
-                            statusBadge.textContent = 'Disabled';
-                            statusBadge.className = 'status-badge status-inactive';
-                        }
-                    }
-
-                    function displayLeaderboard(leaderboard) {
-                        if (!leaderboard || leaderboard.length === 0) {
-                            leaderboardList.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🏆</div><div class="empty-state-title">No Data Available</div><div class="empty-state-description">Start gaining XP to appear on the leaderboard!</div></div>';
-                            return;
-                        }
-
-                        const leaderboardHTML = leaderboard.map(entry => {
-                            const rankEmoji = entry.rank === 1 ? '🥇' : entry.rank === 2 ? '🥈' : entry.rank === 3 ? '🥉' : '📍';
-                            
-                            let valueText;
-                            switch (currentLeaderboardType) {
-                                case 'voice':
-                                    valueText = \`\${entry.value} minutes\`;
-                                    break;
-                                case 'reactions':
-                                    valueText = \`\${entry.value} reactions\`;
-                                    break;
-                                default:
-                                    valueText = \`\${entry.value.toLocaleString()} XP\`;
-                            }
-
-                            return \`
-                                <div class="leaderboard-item">
-                                    <div class="rank">\${rankEmoji}</div>
-                                    <div class="member-info">
-                                        <div class="member-avatar">
-                                            \${entry.avatar ? \`<img src="\${entry.avatar}" alt="\${entry.displayName}">\` : entry.displayName.charAt(0).toUpperCase()}
-                                        </div>
-                                        <div class="member-details">
-                                            <div class="member-name">\${entry.displayName}</div>
-                                            <div class="member-stats">\${valueText}</div>
-                                        </div>
-                                    </div>
-                                    \${currentLeaderboardType === 'overall' ? \`
-                                        <div class="member-progress">
-                                            <div class="progress-bar">
-                                                <div class="progress-fill" style="width: \${entry.progressToNext}%"></div>
-                                            </div>
-                                            <small style="color: var(--text-muted); font-size: 11px;">Level \${entry.level}</small>
-                                        </div>
-                                    \` : ''}
-                                </div>
-                            \`;
-                        }).join('');
-
-                        leaderboardList.innerHTML = leaderboardHTML;
-                    }
-
-                    async function handleSettingsSave(e) {
-                        e.preventDefault();
-                        if (!currentServerId) return;
-
-                        const formData = new FormData(levelingSettingsForm);
-                        const saveButton = document.getElementById('saveLevelingSettings');
-                        
-                        // Show loading state
-                        saveButton.disabled = true;
-                        saveButton.innerHTML = '<span class="btn-icon">⏳</span> Saving...';
-
-                        try {
-                            const settingsData = {
-                                xpSources: {
-                                    messages: formData.get('xpSources.messages') === 'on',
-                                    voice: formData.get('xpSources.voice') === 'on',
-                                    reactions: formData.get('xpSources.reactions') === 'on'
-                                },
-                                xpMultiplier: parseFloat(formData.get('xpMultiplier')) || 1.0,
-                                levelUpChannel: formData.get('levelUpChannel') || null,
-                                levelUpMessage: formData.get('levelUpMessage') || '🎉 {user} reached level {level}!'
-                            };
-
-                            const response = await fetch(\`/api/plugins/leveling/settings/\${currentServerId}\`, {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify(settingsData)
-                            });
-
-                            if (!response.ok) throw new Error('Failed to save settings');
-
-                            settings = { ...settings, ...settingsData };
-                            updateStatusBadge();
-                            showNotification('Settings saved successfully!', 'success');
-                        } catch (error) {
-                            console.error('Error saving settings:', error);
-                            showNotification('Failed to save settings', 'error');
-                        } finally {
-                            saveButton.disabled = false;
-                            saveButton.innerHTML = '<span class="btn-icon">💾</span> Save Settings';
-                        }
-                    }
-
-                    function handleLeaderboardTabChange(e) {
-                        // Remove active class from all tabs
-                        leaderboardTabs.forEach(tab => tab.classList.remove('active'));
-                        
-                        // Add active class to clicked tab
-                        e.target.classList.add('active');
-                        
-                        // Update current type and reload leaderboard
-                        currentLeaderboardType = e.target.dataset.type;
-                        loadLeaderboard();
-                    }
-
-                    async function handleExportData() {
-                        if (!currentServerId) return;
-
-                        try {
-                            exportButton.disabled = true;
-                            exportButton.innerHTML = '<span class="btn-icon">⏳</span> Exporting...';
-
-                            const response = await fetch(\`/api/plugins/leveling/export/\${currentServerId}\`);
-                            if (!response.ok) throw new Error('Failed to export data');
-
-                            const blob = await response.blob();
-                            const url = window.URL.createObjectURL(blob);
-                            const a = document.createElement('a');
-                            a.href = url;
-                            a.download = \`leveling-data-\${currentServerId}-\${Date.now()}.json\`;
-                            document.body.appendChild(a);
-                            a.click();
-                            document.body.removeChild(a);
-                            window.URL.revokeObjectURL(url);
-
-                            showNotification('Data exported successfully!', 'success');
-                        } catch (error) {
-                            console.error('Error exporting data:', error);
-                            showNotification('Failed to export data', 'error');
-                        } finally {
-                            exportButton.disabled = false;
-                            exportButton.innerHTML = '<span class="btn-icon">📤</span> Export Data';
-                        }
-                    }
-
-                    function handleResetSettings() {
-                        if (!confirm('Are you sure you want to reset all settings to defaults? This cannot be undone.')) {
-                            return;
-                        }
-
-                        // Reset form to defaults
-                        document.getElementById('xpSourceMessages').checked = true;
-                        document.getElementById('xpSourceVoice').checked = true;
-                        document.getElementById('xpSourceReactions').checked = true;
-                        document.getElementById('xpMultiplier').value = 1.0;
-                        document.getElementById('levelUpChannel').value = '';
-                        document.getElementById('levelUpMessage').value = '🎉 {user} reached level {level}!';
-
-                        showNotification('Settings reset to defaults. Remember to save!', 'info');
-                    }
-
-                    async function handleXpManagement(e) {
-                        const action = e.target.closest('button').dataset.action;
-                        const userId = adminUserId.value.trim();
-                        const amount = parseInt(adminXpAmount.value);
-
-                        if (!userId || !amount || amount < 1) {
-                            showNotification('Please enter a valid User ID and XP amount', 'error');
-                            return;
-                        }
-
-                        if (!currentServerId) {
-                            showNotification('Please select a server first', 'error');
-                            return;
-                        }
-
-                        const button = e.target.closest('button');
-                        const originalHTML = button.innerHTML;
-                        button.disabled = true;
-                        button.innerHTML = '<span class="btn-icon">⏳</span> Processing...';
-
-                        try {
-                            const response = await fetch(\`/api/plugins/leveling/manage-xp/\${currentServerId}\`, {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ userId, amount, action })
-                            });
-
-                            const result = await response.json();
-
-                            if (!response.ok) {
-                                throw new Error(result.error || 'Failed to manage XP');
-                            }
-
-                            showNotification(result.message, 'success');
-                            
-                            // Clear form
-                            adminUserId.value = '';
-                            adminXpAmount.value = '';
-                            
-                            // Refresh stats and leaderboard
-                            await Promise.all([loadStats(), loadLeaderboard()]);
-                        } catch (error) {
-                            console.error('Error managing XP:', error);
-                            showNotification(error.message || 'Failed to manage XP', 'error');
-                        } finally {
-                            button.disabled = false;
-                            button.innerHTML = originalHTML;
-                        }
-                    }
-
-                    async function updateStats() {
-                        if (currentServerId) {
-                            await loadStats();
-                        }
-                    }
-
-                    // Helper function for notifications
-                    function showNotification(message, type = 'info') {
-                        if (window.dashboardAPI?.showNotification) {
-                            window.dashboardAPI.showNotification(message, type);
-                        } else {
-                            console.log(\`[\${type.toUpperCase()}] \${message}\`);
-                        }
-                    }
-
-                    // Initialize plugin when DOM is ready
-                    if (document.readyState === 'loading') {
-                        document.addEventListener('DOMContentLoaded', init);
-                    } else {
-                        init();
-                    }
-                })();
-            `
+            html: `<div class="plugin-container"><div class="page-header"><div><h1 class="page-title">Leveling System</h1><p class="page-subtitle">Configure XP sources, view leaderboards, and manage user levels</p></div><div><button id="exportLevelingData" class="btn btn-secondary">📤 Export Data</button></div></div><div class="stats-section"><div class="stats-grid"><div class="stat-card"><div class="stat-icon" style="background: linear-gradient(135deg, #4f46e5, #7c3aed);">📊</div><div class="stat-content"><div class="stat-value" id="activeUsersCount">0</div><div class="stat-label">Active Users</div></div></div><div class="stat-card"><div class="stat-icon" style="background: linear-gradient(135deg, #22c55e, #16a34a);">⭐</div><div class="stat-content"><div class="stat-value" id="totalXPCount">0</div><div class="stat-label">Total XP</div></div></div><div class="stat-card"><div class="stat-icon" style="background: linear-gradient(135deg, #f59e0b, #d97706);">🎯</div><div class="stat-content"><div class="stat-value" id="maxLevelCount">0</div><div class="stat-label">Highest Level</div></div></div><div class="stat-card"><div class="stat-icon" style="background: linear-gradient(135deg, #ef4444, #dc2626);">🎤</div><div class="stat-content"><div class="stat-value" id="voiceTimeCount">0</div><div class="stat-label">Voice Minutes</div></div></div></div></div><div class="widget"><div class="widget-header"><h3>⚙️ Leveling Settings</h3><span id="levelingStatus" class="status-badge status-inactive">Disabled</span></div><div class="widget-content"><form id="levelingSettingsForm"><div class="form-row"><div class="form-group"><label>XP Sources</label><div class="checkbox-group"><label><input type="checkbox" id="xpSourceMessages"> 💬 Messages (10-25 XP)</label><label><input type="checkbox" id="xpSourceVoice"> 🎤 Voice Activity (1 XP/min)</label><label><input type="checkbox" id="xpSourceReactions"> 😄 Reactions (2 XP each)</label></div></div><div class="form-group"><label for="xpMultiplier">XP Multiplier</label><input type="number" id="xpMultiplier" class="form-control" min="0.1" max="10" step="0.1" value="1.0"><small>Multiply all XP gains (0.1x to 10x)</small></div></div><div class="form-row"><div class="form-group"><label for="levelUpChannel">Level Up Channel</label><select id="levelUpChannel" class="form-control"><option value="">Select a channel...</option></select></div><div class="form-group"><label for="levelUpMessage">Level Up Message</label><input type="text" id="levelUpMessage" class="form-control" placeholder="🎉 {user} reached level {level}!" value="🎉 {user} reached level {level}!"><small>Use {user} and {level} placeholders</small></div></div><div class="btn-group"><button type="submit" id="saveLevelingSettings" class="btn btn-primary">💾 Save Settings</button><button type="button" id="resetLevelingSettings" class="btn btn-secondary">🔄 Reset</button></div></form></div></div><div class="widget"><div class="widget-header"><h3>🏆 Leaderboards</h3><div class="leaderboard-tabs"><button class="tab-btn active" data-type="overall">Overall XP</button><button class="tab-btn" data-type="voice">Voice Activity</button><button class="tab-btn" data-type="reactions">Reactions</button></div></div><div class="widget-content"><div id="leaderboardContent"><div id="leaderboardLoading" style="display: none;">Loading leaderboard...</div><div id="leaderboardList"></div></div></div></div><div class="widget"><div class="widget-header"><h3>👑 Admin Management</h3></div><div class="widget-content"><div class="form-row"><div class="form-group"><label for="adminUserId">User ID</label><input type="text" id="adminUserId" class="form-control" placeholder="Enter Discord User ID"></div><div class="form-group"><label for="adminXpAmount">XP Amount</label><input type="number" id="adminXpAmount" class="form-control" placeholder="Enter XP amount" min="1"></div></div><div class="btn-group"><button id="addXpBtn" class="btn btn-success" data-action="add">➕ Add XP</button><button id="removeXpBtn" class="btn btn-warning" data-action="remove">➖ Remove XP</button><button id="setXpBtn" class="btn btn-danger" data-action="set">🎯 Set XP</button></div></div></div></div>`,
+            script: `(function(){console.log("📈 Leveling Plugin script starting...");let a=null,b="overall",c={};const d=document.getElementById("serverDropdown");function e(){console.log("🚀 Leveling Plugin initializing..."),f(),d&&d.value&&(a=d.value,g())}function f(){d&&d.addEventListener("change",h);const e=document.getElementById("levelingSettingsForm");e&&e.addEventListener("submit",i),document.addEventListener("click",function(a){const c=a.target.closest(".tab-btn");c&&c.dataset.type&&j(a)});const f=document.getElementById("exportLevelingData");f&&f.addEventListener("click",k);const g=document.getElementById("resetLevelingSettings");g&&g.addEventListener("click",l);["addXpBtn","removeXpBtn","setXpBtn"].forEach(a=>{const b=document.getElementById(a);b&&b.addEventListener("click",m)}),setInterval(n,3e4)}async function g(){a&&await Promise.all([o(),p(),q(),r()])}async function h(){a=d.value,a&&await g()}async function o(){if(!a)return;try{const b=await fetch("/api/plugins/leveling/settings/"+a);if(!b.ok)throw new Error("Failed to load settings");c=await b.json(),s(),t()}catch(a){console.error("Error loading settings:",a)}}async function p(){if(!a)return;try{const b=await fetch("/api/plugins/leveling/stats/"+a);if(!b.ok)throw new Error("Failed to load stats");const c=await b.json();u(c)}catch(a){console.error("Error loading stats:",a)}}async function q(){if(!a)return;try{const b=await fetch("/api/channels/"+a);if(!b.ok)throw new Error("Failed to load channels");const c=await b.json();v(c)}catch(a){console.error("Error loading channels:",a)}}async function r(){if(!a)return;const c=document.getElementById("leaderboardLoading"),d=document.getElementById("leaderboardList");c&&(c.style.display="block"),d&&(d.innerHTML="");try{const c=await fetch("/api/plugins/leveling/leaderboard/"+a+"?type="+b+"&limit=10");if(!c.ok)throw new Error("Failed to load leaderboard");const e=await c.json();w(e)}catch(a){console.error("Error loading leaderboard:",a),d&&(d.innerHTML='<div class="empty-state">Failed to load leaderboard</div>')}finally{c&&(c.style.display="none")}}function s(){const a={xpSourceMessages:c.xpSources?.messages||!1,xpSourceVoice:c.xpSources?.voice||!1,xpSourceReactions:c.xpSources?.reactions||!1,xpMultiplier:c.xpMultiplier||1,levelUpChannel:c.levelUpChannel||"",levelUpMessage:c.levelUpMessage||"🎉 {user} reached level {level}!"};Object.keys(a).forEach(b=>{const c=document.getElementById(b);c&&("checkbox"===c.type?c.checked=a[b]:c.value=a[b])})}function v(a){const b=document.getElementById("levelUpChannel");b&&(b.innerHTML='<option value="">Select a channel...</option>',a.forEach(a=>{if(0===a.type){const c=document.createElement("option");c.value=a.id,c.textContent="#"+a.name,b.appendChild(c)}}),c.levelUpChannel&&(b.value=c.levelUpChannel))}function u(a){const b={activeUsersCount:a.serverUsers||0,totalXPCount:a.totalXP||0,maxLevelCount:a.maxLevel||0,voiceTimeCount:Math.floor(a.totalVoiceTime||0)};Object.keys(b).forEach(a=>{const c=document.getElementById(a);if(c){const d=b[a];c.textContent="number"==typeof d?d.toLocaleString():d}})}function t(){const a=document.getElementById("levelingStatus");if(!a)return;const b=c.xpSources?.messages||c.xpSources?.voice||c.xpSources?.reactions;b?(a.textContent="Active",a.className="status-badge status-active"):(a.textContent="Disabled",a.className="status-badge status-inactive")}function w(a){const c=document.getElementById("leaderboardList");if(!c)return;if(!a||0===a.length)return void(c.innerHTML='<div class="empty-state">No data available</div>');const d=a.map((a,c)=>{const d=c+1,e=1===d?"🥇":2===d?"🥈":3===d?"🥉":"📍",f=a.value||0;let g;switch(b){case"voice":g=f+" minutes";break;case"reactions":g=f+" reactions";break;default:g=f.toLocaleString()+" XP"}const h=a.displayName||a.username||"Unknown User",i=a.avatar,j=a.level||0,k=a.progressToNext||0;return'<div class="leaderboard-item"><div class="rank">'+e+'</div><div class="member-info"><div class="member-avatar">'+(i?'<img src="'+i+'" alt="'+h+'">':h.charAt(0).toUpperCase())+'</div><div class="member-details"><div class="member-name">'+h+'</div><div class="member-stats">'+g+"</div></div></div>"+("overall"===b?'<div class="member-progress"><div class="progress-bar"><div class="progress-fill" style="width: '+k+'%"></div></div><small style="color: var(--text-muted); font-size: 11px;">Level '+j+"</small></div>":"")+"</div>"}).join("");c.innerHTML=d}async function i(b){if(b.preventDefault(),!a)return;const d=document.getElementById("saveLevelingSettings");d&&(d.disabled=!0,d.textContent="Saving...");try{const b={xpSources:{messages:document.getElementById("xpSourceMessages").checked,voice:document.getElementById("xpSourceVoice").checked,reactions:document.getElementById("xpSourceReactions").checked},xpMultiplier:parseFloat(document.getElementById("xpMultiplier").value)||1,levelUpChannel:document.getElementById("levelUpChannel").value||null,levelUpMessage:document.getElementById("levelUpMessage").value||"🎉 {user} reached level {level}!"},e=await fetch("/api/plugins/leveling/settings/"+a,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});if(!e.ok)throw new Error("Failed to save settings");c=Object.assign(c,b),t(),x("Settings saved successfully!","success")}catch(a){console.error("Error saving settings:",a),x("Failed to save settings","error")}finally{d&&(d.disabled=!1,d.textContent="💾 Save Settings")}}function j(a){document.querySelectorAll(".tab-btn").forEach(a=>{a.classList.remove("active")}),a.target.classList.add("active"),b=a.target.dataset.type,r()}async function k(){if(!a)return;try{const b=document.getElementById("exportLevelingData");b&&(b.disabled=!0,b.textContent="Exporting...");const c=await fetch("/api/plugins/leveling/export/"+a);if(!c.ok)throw new Error("Failed to export data");const d=await c.blob(),e=window.URL.createObjectURL(d),f=document.createElement("a");f.href=e,f.download="leveling-data-"+a+"-"+Date.now()+".json",document.body.appendChild(f),f.click(),document.body.removeChild(f),window.URL.revokeObjectURL(e),x("Data exported successfully!","success")}catch(a){console.error("Error exporting data:",a),x("Failed to export data","error")}finally{const a=document.getElementById("exportLevelingData");a&&(a.disabled=!1,a.textContent="📤 Export Data")}}function l(){confirm("Are you sure you want to reset all settings to defaults?")&&(document.getElementById("xpSourceMessages").checked=!0,document.getElementById("xpSourceVoice").checked=!0,document.getElementById("xpSourceReactions").checked=!0,document.getElementById("xpMultiplier").value=1,document.getElementById("levelUpChannel").value="",document.getElementById("levelUpMessage").value="🎉 {user} reached level {level}!",x("Settings reset to defaults. Remember to save!","info"))}async function m(b){const c=b.target.dataset.action,d=document.getElementById("adminUserId").value.trim(),e=parseInt(document.getElementById("adminXpAmount").value);if(!d||!e||e<1)return void x("Please enter a valid User ID and XP amount","error");if(!a)return void x("Please select a server first","error");const f=b.target,g=f.textContent;f.disabled=!0,f.textContent="Processing...";try{const b=await fetch("/api/plugins/leveling/manage-xp/"+a,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({userId:d,amount:e,action:c})}),g=await b.json();if(!b.ok)throw new Error(g.error||"Failed to manage XP");x(g.message,"success"),document.getElementById("adminUserId").value="",document.getElementById("adminXpAmount").value="",await Promise.all([p(),r()])}catch(a){console.error("Error managing XP:",a),x(a.message||"Failed to manage XP","error")}finally{f.disabled=!1,f.textContent=g}}async function n(){a&&await p()}function x(a,b){window.dashboardAPI&&window.dashboardAPI.showNotification?window.dashboardAPI.showNotification(a,b):console.log("["+b.toUpperCase()+"] "+a)}setTimeout(e,200)})();`
         };
     }
 }
