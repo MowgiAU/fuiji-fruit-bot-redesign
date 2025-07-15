@@ -581,7 +581,7 @@ class LevelingPlugin {
 
     getFrontendComponent() {
         return {
-            id: 'leveling-system',
+            id: 'leveling',  // Changed to match the page ID in dashboard.html
             name: 'Leveling System',
             description: 'XP and leveling system with multiple sources and leaderboards',
             icon: '📈',
@@ -818,10 +818,9 @@ class LevelingPlugin {
                     function initializeElements() {
                         console.log("🔄 Leveling Plugin: Initializing elements...");
                         
-                        // Get DOM elements safely
+                        // Get DOM elements safely - but don't cache tabs since they might change
                         serverSelect = window.serverSelect || safeGetElement('#serverSelect, #ccServerSelect');
                         levelingSettingsForm = safeGetElement('#levelingSettingsForm');
-                        leaderboardTabs = safeGetElements('.tab-btn');
                         leaderboardContent = safeGetElement('#leaderboardContent');
                         leaderboardLoading = safeGetElement('#leaderboardLoading');
                         leaderboardList = safeGetElement('#leaderboardList');
@@ -852,17 +851,35 @@ class LevelingPlugin {
                             levelingSettingsForm.addEventListener('submit', handleSettingsSubmit);
                         }
 
-                        // Leaderboard tabs
-                        leaderboardTabs.forEach(tab => {
-                            if (tab) {
-                                tab.addEventListener('click', (e) => {
-                                    const tabType = tab.getAttribute('data-tab') || tab.getAttribute('data-type');
-                                    if (tabType) {
-                                        switchLeaderboardTab(tabType);
-                                    }
-                                });
+                        // Leaderboard tabs with event delegation - using the most specific container
+                        setTimeout(() => {
+                            const leaderboardSection = document.querySelector('.widget:has(.leaderboard-tabs)') || 
+                                                      document.querySelector('#leaderboardContent')?.closest('.widget') ||
+                                                      document.querySelector('.widget');
+                            
+                            if (leaderboardSection) {
+                                // Remove any existing listeners to prevent duplicates
+                                leaderboardSection.removeEventListener('click', handleTabClick);
+                                // Add the listener
+                                leaderboardSection.addEventListener('click', handleTabClick);
+                                console.log('✅ Leaderboard tab listeners setup with event delegation');
+                            } else {
+                                console.warn('⚠️ Could not find leaderboard widget for event delegation');
                             }
-                        });
+                        }, 100);
+                        
+                        function handleTabClick(e) {
+                            const clickedTab = e.target.closest('.tab-btn');
+                            if (clickedTab && clickedTab.closest('.leaderboard-tabs')) {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                const tabType = clickedTab.getAttribute('data-tab') || clickedTab.getAttribute('data-type');
+                                if (tabType) {
+                                    console.log(\`🎯 Tab clicked: \${tabType}\`);
+                                    switchLeaderboardTab(tabType);
+                                }
+                            }
+                        }
 
                         // Export button
                         if (exportButton) {
@@ -1008,21 +1025,55 @@ class LevelingPlugin {
                     function switchLeaderboardTab(tabType) {
                         console.log(\`🔄 Switching leaderboard tab to: \${tabType}\`);
                         
-                        // Update tab buttons safely
-                        leaderboardTabs.forEach(tab => {
-                            if (tab) {
-                                safeRemoveClass(tab, 'active');
-                                const tabTypeAttr = tab.getAttribute('data-tab') || tab.getAttribute('data-type');
-                                if (tabTypeAttr === tabType) {
-                                    safeAddClass(tab, 'active');
+                        try {
+                            // Wait a moment for DOM to be stable
+                            requestAnimationFrame(() => {
+                                // Find the leaderboard tabs container with multiple fallbacks
+                                let tabsContainer = document.querySelector('.leaderboard-tabs');
+                                
+                                if (!tabsContainer) {
+                                    // Fallback: look for any tabs in the leveling plugin container
+                                    const pluginContainer = document.getElementById('levelingPluginContainer');
+                                    if (pluginContainer) {
+                                        tabsContainer = pluginContainer.querySelector('.leaderboard-tabs');
+                                    }
                                 }
-                            }
-                        });
+                                
+                                if (!tabsContainer) {
+                                    console.warn('⚠️ Leaderboard tabs container not found');
+                                    return;
+                                }
+                                
+                                // Get all tab buttons within the container
+                                const currentTabs = tabsContainer.querySelectorAll('.tab-btn');
+                                console.log(\`Found \${currentTabs.length} tab buttons\`);
+                                
+                                // Update tab buttons safely
+                                currentTabs.forEach((tab, index) => {
+                                    try {
+                                        if (tab && typeof tab.classList !== 'undefined') {
+                                            tab.classList.remove('active');
+                                            const tabTypeAttr = tab.getAttribute('data-tab') || tab.getAttribute('data-type');
+                                            if (tabTypeAttr === tabType) {
+                                                tab.classList.add('active');
+                                                console.log(\`✅ Activated tab \${index}: \${tabType}\`);
+                                            }
+                                        }
+                                    } catch (tabError) {
+                                        console.warn(\`Warning updating tab \${index}:\`, tabError);
+                                    }
+                                });
 
-                        // Update current type and reload
-                        currentLeaderboardType = tabType;
-                        if (currentServerId) {
-                            loadLeaderboard();
+                                // Update current type and reload
+                                currentLeaderboardType = tabType;
+                                if (currentServerId) {
+                                    loadLeaderboard();
+                                } else {
+                                    console.warn('⚠️ No server selected for leaderboard load');
+                                }
+                            });
+                        } catch (error) {
+                            console.error('Error switching leaderboard tab:', error);
                         }
                     }
 
