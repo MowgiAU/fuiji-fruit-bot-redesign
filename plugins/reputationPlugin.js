@@ -1099,7 +1099,7 @@ class ReputationPlugin {
    
    getFrontendComponent() {
 	   return {
-		   id: 'reputation-plugin',
+		   id: 'reputation-system',
 		   name: 'Reputation System',
 		   description: 'Advanced reputation system with categories, reasons, decay, and anti-abuse features',
 		   icon: '🏆',

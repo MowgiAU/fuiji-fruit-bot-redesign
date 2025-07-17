@@ -671,7 +671,7 @@ class CustomCommandsPlugin {
 
     getFrontendComponent() {
         return {
-            id: 'custom-commands-plugin',
+            id: 'custom-commands', 
             name: 'Custom Commands',
             description: 'Advanced custom command system with visual flow editor, AI triggers, and templating',
             icon: '⚡',

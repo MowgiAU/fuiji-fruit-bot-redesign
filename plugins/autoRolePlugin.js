@@ -954,7 +954,7 @@ class AutoRolePlugin {
     }
 	getFrontendComponent() {
         return {
-            id: 'auto-role-plugin',
+            id: 'auto-role',  
             name: 'Auto-Role System',
             description: 'Manage automatic role assignment, reaction roles, and level-based roles',
             icon: '🎭',
